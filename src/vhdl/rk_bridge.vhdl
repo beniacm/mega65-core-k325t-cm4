@@ -9,6 +9,7 @@
 --   0x10 SD_PUT   : cmd, 512 bytes  -> read buffer; marks read data ready
 --   0x11 SD_GET   : cmd, dummy, 512 bytes of the captured write block
 --   0x12 SD_WACK  : cmd             -> write block consumed, release busy
+--   0x13 SD_RERR  : cmd             -> pending read is out of range (error token)
 --   0x20 UART_PUT : cmd, N bytes    -> MEGA65 serial monitor input (RsRx)
 --   0x21 UART_GET : cmd, dummy, N bytes of monitor output (0x00 when empty)
 --   0x30 INPUT    : cmd, ctrl, joyA, joyB, col0..col8   (all active high)
@@ -22,6 +23,7 @@
 --   9..10 uart rx count (BE) 11..12 uart tx free (BE) 13 sd cmd count
 --   14 last sd cmd (b7 = ACMD) 15 ctrl readback
 --   flags: b0 rd_req b1 rd_ready b2 wr_req b3 sd inited b4 uart rx overflow
+--          b5 rd_error
 --
 -- The monitor UART is bridged inside the FPGA at 20 clocks/bit
 -- (monitor_ctrl.v divisor 19 -> 2.025 Mbaud at 40.5 MHz).
@@ -47,6 +49,7 @@ entity rk_bridge is
     sd_cmd_cnt : in  unsigned(7 downto 0);
     sd_last_cmd: in  unsigned(7 downto 0);
     sd_rd_ready: out std_logic;
+    sd_rd_error: out std_logic;
     sd_wr_ack  : out std_logic;
     rbuf_addr  : in  unsigned(8 downto 0);
     rbuf_data  : out std_logic_vector(7 downto 0);
@@ -97,6 +100,7 @@ architecture rtl of rk_bridge is
   signal wbuf_raddr : unsigned(8 downto 0) := (others => '0');
   signal wbuf_dout  : std_logic_vector(7 downto 0) := (others => '0');
   signal rd_ready_r : std_logic := '0';
+  signal rd_error_r : std_logic := '0';
   signal wr_ack_r   : std_logic := '0';
 
   -- UART FIFOs (pointers carry one extra wrap bit)
@@ -146,6 +150,7 @@ begin
 
   spi_miso    <= miso_r;
   sd_rd_ready <= rd_ready_r;
+  sd_rd_error <= rd_error_r;
   sd_wr_ack   <= wr_ack_r;
   joya        <= joya_r;
   joyb        <= joyb_r;
@@ -201,6 +206,7 @@ begin
       -- The emulator dropped its read request: the data has been delivered.
       if sd_rd_req = '0' then
         rd_ready_r <= '0';
+        rd_error_r <= '0';
       end if;
 
       ------------------------------------------------------------------
@@ -236,6 +242,7 @@ begin
             case rxb is
               when x"11" => wbuf_raddr <= (others => '0');   -- prefetch
               when x"12" => wr_ack_r <= '1';
+              when x"13" => rd_error_r <= sd_rd_req;
               when others => null;
             end case;
           else
@@ -246,7 +253,7 @@ begin
                   when 0  => nxt := x"4D";
                   when 1  => nxt := x"65";
                   when 2  => nxt := VERSION;
-                  when 3  => nxt := "000" & rx_overflow & sd_inited & sd_wr_req
+                  when 3  => nxt := "00" & rd_error_r & rx_overflow & sd_inited & sd_wr_req
                                     & rd_ready_r & sd_rd_req;
                   when 4  => nxt := std_logic_vector(sd_seq);
                   when 5  => nxt := std_logic_vector(sd_lba(31 downto 24));

@@ -40,6 +40,7 @@ entity sd_emu is
     req_lba  : out unsigned(31 downto 0);
     req_seq  : out unsigned(7 downto 0);   -- +1 per request
     rd_ready : in  std_logic;              -- read buffer filled for this request
+    rd_error : in  std_logic;              -- server: sector out of range -> error token
     wr_ack   : in  std_logic;              -- one-clock pulse: write consumed
     -- read buffer (filled by the server), synchronous read
     rbuf_addr : out unsigned(8 downto 0);
@@ -57,7 +58,7 @@ end entity;
 
 architecture rtl of sd_emu is
 
-  type mode_t is (M_IDLE, M_CMD, M_RESP, M_RD_WAIT, M_RD_DATA, M_W_RX,
+  type mode_t is (M_IDLE, M_CMD, M_RESP, M_RD_WAIT, M_RD_DATA, M_RD_ERR, M_W_RX,
                   M_W_RESP, M_W_BUSY, M_W_REL);
   type after_t is (A_IDLE, A_READ, A_WRITE);
   type wsub_t is (W_TOKEN, W_DATA, W_CRC);
@@ -262,7 +263,12 @@ begin
               tx_sr   <= tx_sr(6 downto 0) & '1';
               tx_left <= tx_left - 1;
             elsif mode = M_RD_WAIT then
-              if rd_ready = '1' then
+              if rd_error = '1' then
+                -- Data error token "out of range" (0000_1000): the controller
+                -- reports an error, exactly like a real card read past its end.
+                load_byte(x"08");
+                mode <= M_RD_ERR;
+              elsif rd_ready = '1' then
                 load_byte(x"FE");        -- start token
                 idx  <= (others => '0'); -- prefetch byte 0
                 mode <= M_RD_DATA;
@@ -281,6 +287,17 @@ begin
                 miso_r   <= '1';
                 mode     <= M_IDLE;
               end if;
+            end if;
+
+          when M_RD_ERR =>
+            if tx_left /= 0 then
+              miso_r  <= tx_sr(7);
+              tx_sr   <= tx_sr(6 downto 0) & '1';
+              tx_left <= tx_left - 1;
+            else
+              rd_req_r <= '0';
+              miso_r   <= '1';
+              mode     <= M_IDLE;
             end if;
 
           when M_W_RX =>

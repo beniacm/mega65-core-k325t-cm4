@@ -159,6 +159,7 @@ architecture Behavioral of container is
   signal sd_cs_int, sd_clk_int, sd_mosi_int, sd_miso_int : std_logic;
   signal emu_miso   : std_logic;
   signal emu_rd_req, emu_wr_req, emu_rd_ready, emu_wr_ack, emu_inited : std_logic;
+  signal emu_rd_error : std_logic;
   signal emu_lba    : unsigned(31 downto 0);
   signal emu_seq, emu_ccnt, emu_lcmd : unsigned(7 downto 0);
   signal emu_rba, emu_wba : unsigned(8 downto 0);
@@ -348,7 +349,7 @@ begin
       clk => cpuclock,
       sd_cs_n => sd_cs_int, sd_sclk => sd_clk_int, sd_mosi => sd_mosi_int, sd_miso => emu_miso,
       rd_req => emu_rd_req, wr_req => emu_wr_req, req_lba => emu_lba, req_seq => emu_seq,
-      rd_ready => emu_rd_ready, wr_ack => emu_wr_ack,
+      rd_ready => emu_rd_ready, rd_error => emu_rd_error, wr_ack => emu_wr_ack,
       rbuf_addr => emu_rba, rbuf_data => emu_rbd,
       wbuf_we => emu_wbwe, wbuf_addr => emu_wba, wbuf_data => emu_wbd,
       inited => emu_inited, cmd_count => emu_ccnt, last_cmd => emu_lcmd
@@ -360,7 +361,7 @@ begin
       spi_sck => rk_sck, spi_cs_n => rk_cs_n, spi_mosi => rk_mosi, spi_miso => rk_miso,
       sd_rd_req => emu_rd_req, sd_wr_req => emu_wr_req, sd_lba => emu_lba, sd_seq => emu_seq,
       sd_inited => emu_inited, sd_cmd_cnt => emu_ccnt, sd_last_cmd => emu_lcmd,
-      sd_rd_ready => emu_rd_ready, sd_wr_ack => emu_wr_ack,
+      sd_rd_ready => emu_rd_ready, sd_rd_error => emu_rd_error, sd_wr_ack => emu_wr_ack,
       rbuf_addr => emu_rba, rbuf_data => emu_rbd,
       wbuf_we => emu_wbwe, wbuf_addr => emu_wba, wbuf_data => emu_wbd,
       mon_rx => mon_rx, mon_tx => uart_txd_int,
