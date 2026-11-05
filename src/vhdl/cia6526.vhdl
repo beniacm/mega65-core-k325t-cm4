@@ -77,13 +77,17 @@ architecture behavioural of cia6526 is
   signal reg_porta_read : unsigned(7 downto 0) := (others => '0');
   signal reg_portb_read : unsigned(7 downto 0) := (others => '0');
 
-  signal reg_timera : unsigned(15 downto 0) := x"0001";
-  signal reg_timera_visible : unsigned(15 downto 0) := x"0001";
-  signal reg_timera_latch : unsigned(15 downto 0) := x"0001";
+  -- Power-on timer values match the MOS 6526 (latches and counters are $FFFF
+  -- after reset).  With the previous $0001/$0000 the MEGA65 ROM's RTC-less
+  -- clock calibration (CIA2 32-bit timer, ROM 920413 offset $156E6) waits for
+  -- bit 6/7 of timer A forever on boards without an I2C RTC.
+  signal reg_timera : unsigned(15 downto 0) := x"FFFF";
+  signal reg_timera_visible : unsigned(15 downto 0) := x"FFFF";
+  signal reg_timera_latch : unsigned(15 downto 0) := x"FFFF";
 
-  signal reg_timerb : unsigned(15 downto 0) := x"0000";
-  signal reg_timerb_visible : unsigned(15 downto 0) := x"0000";
-  signal reg_timerb_latch : unsigned(15 downto 0) := x"0000";
+  signal reg_timerb : unsigned(15 downto 0) := x"FFFF";
+  signal reg_timerb_visible : unsigned(15 downto 0) := x"FFFF";
+  signal reg_timerb_latch : unsigned(15 downto 0) := x"FFFF";
 
   signal reg_timera_tick_source : std_logic := '0'; 
   signal reg_timera_oneshot : std_logic := '0';
