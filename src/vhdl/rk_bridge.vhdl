@@ -87,8 +87,6 @@ entity rk_bridge is
     ctrl           : out std_logic_vector(7 downto 0);
     -- paddles / 1351 mouse: pot1 x, pot1 y, pot2 x, pot2 y (INPUT bytes 13..16), $FF = open
     pots           : out std_logic_vector(31 downto 0);
-    -- free-form debug bytes, returned by STATUS bytes 20..51 (byte 20 = bits 7..0)
-    dbg_ext        : in  std_logic_vector(255 downto 0) := (others => '0');
     -- configuration flash pass-through (command 0x50), all in clk: SPI mode 0, ~clk/6
     flash_active   : out std_logic;              -- a 0x50 frame owns the flash pins
     flash_sck      : out std_logic;              -- to STARTUPE2.USRCCLKO
@@ -468,7 +466,6 @@ begin
                   when 17 => if eth_tx_avail = '1' then nxt := std_logic_vector(eth_tx_len(7 downto 0)); end if;
                   when 18 => nxt := "0000" & std_logic_vector(eth_rx_free);
                   when 19 => nxt := std_logic_vector(eth_tx_drops);
-                  when 20 to 51 => nxt := dbg_ext(8 * (st - 20) + 7 downto 8 * (st - 20));
                   when 52 => nxt := CORE_ID;
                   when 53 => nxt := "0000000" & fl_ovf;
                   when others => nxt := x"00";
