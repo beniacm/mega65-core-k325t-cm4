@@ -14,6 +14,13 @@
 --   0x11 SD_GET   : cmd, dummy, 512 bytes of the captured write block
 --   0x12 SD_WACK  : cmd             -> write block consumed, release busy
 --   0x13 SD_RERR  : cmd             -> pending read is out of range (error token)
+--   0x14 SD_PREF  : cmd, slot, count, lba(4, BE), count x 512 bytes  (v4)
+--                   read-ahead: sectors lba.. into prefetch slots slot.. (mod 16), count 1..7
+--                   (the Rockchip's spidev moves at most 4096 bytes per transaction).  A slot is
+--                   invalidated before it is written and validated with its LBA tag once
+--                   complete; the slot the emulator is reading from is never overwritten, and a
+--                   sector whose LBA is being written by the MEGA65 is not validated.
+--   0x15 SD_INVAL : cmd             -> invalidate all prefetch slots (v4)
 --   0x20 UART_PUT : cmd, N bytes    -> MEGA65 serial monitor input (RsRx)
 --   0x21 UART_GET : cmd, dummy, N bytes of monitor output (0x00 when empty)
 --   0x40 ETH_TXGET: cmd, dummy, frame bytes (MAC -> Rockchip; length from STATUS
@@ -34,6 +41,13 @@
 --   18 free Ethernet RX slots   19 Ethernet frames dropped (no free TX slot)
 --   flags: b0 rd_req b1 rd_ready b2 wr_req b3 sd inited b4 uart rx overflow
 --          b5 rd_error
+--   52 core id  53 flash overrun  54..55 prefetch valid bitmap (BE)  56..57 prefetch hits
+--   (BE, wraps)  58 slot the emulator reads (16 = the SD_PUT slot)
+-- Read cache (v4): 16 prefetch slots + 1 demand slot (SD_PUT) in one 16 KB block RAM.  While
+-- a read is pending and unanswered, its LBA is compared with the 16 tags; on a hit the
+-- emulator is switched to that slot and rd_ready rises after a short settle time (the slot
+-- number crosses into cpuclk first) -- no Rockchip round trip.  Writes stay synchronous; a write
+-- captured for an LBA invalidates a slot holding it.
 --
 -- Handshake with sd_emu (levels, safe across the clock domains):
 --   rd_ready / rd_error rise when the server answers and fall once the
@@ -116,14 +130,15 @@ end entity;
 
 architecture rtl of rk_bridge is
 
-  constant VERSION : std_logic_vector(7 downto 0) := x"03";
+  constant VERSION : std_logic_vector(7 downto 0) := x"04";
+  constant DEMAND  : unsigned(4 downto 0) := to_unsigned(16, 5);   -- SD_PUT slot
 
   type ram512_t  is array (0 to 511)  of std_logic_vector(7 downto 0);
   type ram1k_t   is array (0 to 1023) of std_logic_vector(7 downto 0);
   type ram16k_t  is array (0 to 16383) of std_logic_vector(7 downto 0);
   type mat_t     is array (0 to 8) of std_logic_vector(7 downto 0);
 
-  signal rbuf : ram512_t;   -- written in clk, read in cpuclk
+  signal rbuf : ram16k_t;   -- 17 x 512: prefetch slots 0..15 + SD_PUT slot 16; written in clk, read in cpuclk
   signal wbuf : ram512_t;   -- written in cpuclk, read in clk
   signal txf  : ram1k_t;    -- Rockchip -> monitor (clk only)
   signal rxf  : ram16k_t;   -- monitor  -> Rockchip (clk only)
@@ -152,7 +167,24 @@ architecture rtl of rk_bridge is
   signal rd_error_r : std_logic := '0';
   signal wr_ack_r   : std_logic := '0';
   signal rbuf_we    : std_logic := '0';
-  signal rbuf_wa    : unsigned(8 downto 0) := (others => '0');
+  signal rbuf_wa    : unsigned(13 downto 0) := (others => '0');
+  -- read cache
+  type tag_t is array (0 to 15) of unsigned(31 downto 0);
+  signal tags       : tag_t := (others => (others => '0'));
+  signal vld        : std_logic_vector(15 downto 0) := (others => '0');
+  signal match      : std_logic_vector(15 downto 0) := (others => '0');
+  signal act_slot   : unsigned(4 downto 0) := to_unsigned(16, 5);
+  signal act_c1, act_c2 : unsigned(4 downto 0) := to_unsigned(16, 5);   -- cpuclk copies
+  signal hit_wait   : integer range 0 to 15 := 0;
+  signal hit_cnt    : unsigned(15 downto 0) := (others => '0');
+  signal demand_busy: std_logic := '0';
+  signal pf_cur     : unsigned(3 downto 0) := (others => '0');
+  signal pf_count   : integer range 0 to 7 := 0;
+  signal pf_k       : integer range 0 to 8 := 0;
+  signal pf_off     : integer range 0 to 511 := 0;
+  signal pf_lba     : unsigned(31 downto 0) := (others => '0');
+  signal pf_skip    : std_logic := '0';
+  signal fresh1     : std_logic_vector(15 downto 0) := (others => '0');  -- tagged last cycle
   signal rbuf_wd    : std_logic_vector(7 downto 0) := (others => '0');
 
   -- UART FIFOs (pointers carry one extra wrap bit)
@@ -233,7 +265,7 @@ architecture rtl of rk_bridge is
   attribute ASYNC_REG : string;
   attribute ASYNC_REG of rd_req_s, wr_req_s, inited_s, rd_ready_c, rd_error_c,
     wr_ack_c, mon_rx_c, mat_c1, mat_c2, ctrl_c1, ctrl_c2, joya_c1, joya_c2,
-    joyb_c1, joyb_c2, pots_c1, pots_c2, sck_s, cs_s, mosi_s : signal is "TRUE";
+    joyb_c1, joyb_c2, pots_c1, pots_c2, sck_s, cs_s, mosi_s, act_c1, act_c2 : signal is "TRUE";
 
 begin
 
@@ -243,7 +275,9 @@ begin
   process (cpuclk)
   begin
     if rising_edge(cpuclk) then
-      rbuf_data <= rbuf(to_integer(rbuf_addr));
+      -- the slot number is set >= 2 cpuclks before rd_ready rises and held while it is up
+      act_c1 <= act_slot; act_c2 <= act_c1;
+      rbuf_data <= rbuf(to_integer(act_c2 & rbuf_addr));
       if wbuf_we = '1' then
         wbuf(to_integer(wbuf_addr)) <= wbuf_data;
       end if;
@@ -315,8 +349,19 @@ begin
     variable nxt   : std_logic_vector(7 downto 0);
     variable st    : integer range 0 to 4095;
     variable put_i : integer range 0 to 4095;
+    variable vld_v : std_logic_vector(15 downto 0);
+    variable fresh_v : std_logic_vector(15 downto 0);   -- tagged this cycle
+    variable hit_i : integer range 0 to 16;
+
+    -- the slot the emulator is being served from (or is about to be): never overwrite it
+    impure function busy_slot(sl : unsigned(3 downto 0)) return boolean is
+    begin
+      return act_slot = ('0' & sl) and rd_req_s(1) = '1' and (rd_ready_r = '1' or hit_wait /= 0);
+    end function;
   begin
     if rising_edge(clk) then
+      vld_v := vld;
+      fresh_v := (others => '0');
       rbuf_we   <= '0';
       eth_tx_pop  <= '0';
       eth_rx_we   <= '0';
@@ -341,8 +386,20 @@ begin
 
       -- level handshakes fall once the emulator has withdrawn the request
       if rd_req_s(1) = '0' then
-        rd_ready_r <= '0';
-        rd_error_r <= '0';
+        rd_ready_r  <= '0';
+        rd_error_r  <= '0';
+        hit_wait    <= 0;
+        demand_busy <= '0';
+      end if;
+      -- tag compare, registered (lba_f is stable long before a request flag is seen)
+      for i in 0 to 15 loop
+        if tags(i) = lba_f then match(i) <= '1'; else match(i) <= '0'; end if;
+      end loop;
+      -- a write captured for an LBA invalidates its cached copy (writes stay synchronous)
+      if wr_req_s(1) = '1' then
+        for i in 0 to 15 loop
+          if tags(i) = lba_f then vld_v(i) := '0'; end if;
+        end loop;
       end if;
       if wr_req_s(1) = '0' then
         wr_ack_r <= '0';
@@ -438,6 +495,12 @@ begin
               when x"40" => eth_raddr  <= (others => '0');   -- prefetch
               when x"12" => wr_ack_r   <= wr_req_s(1);
               when x"13" => rd_error_r <= rd_req_s(1);
+              when x"10" =>                                  -- demand sector: present slot 16
+                if rd_req_s(1) = '1' and rd_ready_r = '0' and hit_wait = 0 then
+                  act_slot    <= DEMAND;
+                  demand_busy <= '1';
+                end if;
+              when x"15" => vld_v := (others => '0');       -- SD_INVAL
               when others => null;
             end case;
           else
@@ -468,6 +531,11 @@ begin
                   when 19 => nxt := std_logic_vector(eth_tx_drops);
                   when 52 => nxt := CORE_ID;
                   when 53 => nxt := "0000000" & fl_ovf;
+                  when 54 => nxt := vld(15 downto 8);
+                  when 55 => nxt := vld(7 downto 0);
+                  when 56 => nxt := std_logic_vector(hit_cnt(15 downto 8));
+                  when 57 => nxt := std_logic_vector(hit_cnt(7 downto 0));
+                  when 58 => nxt := "000" & std_logic_vector(act_slot);
                   when others => nxt := x"00";
                 end case;
 
@@ -475,12 +543,60 @@ begin
                 put_i := to_integer(bidx) - 1;
                 if put_i < 512 then
                   rbuf_we <= '1';
-                  rbuf_wa <= to_unsigned(put_i, 9);
+                  rbuf_wa <= DEMAND & to_unsigned(put_i, 9);
                   rbuf_wd <= rxb;
-                  if put_i = 511 and rd_req_s(1) = '1' then
-                    rd_ready_r <= '1';
+                  if put_i = 511 and rd_req_s(1) = '1' and demand_busy = '1' then
+                    rd_ready_r <= '1';               -- (a cache hit may have answered already)
                   end if;
                 end if;
+
+              when x"14" =>                 -- SD_PREF: slot, count, lba(4), count x 512 bytes
+                case to_integer(bidx) is
+                  when 1 => pf_cur <= unsigned(rxb(3 downto 0));
+                  when 2 =>
+                    if unsigned(rxb) > 7 then pf_count <= 7; else pf_count <= to_integer(unsigned(rxb)); end if;
+                  when 3 | 4 | 5 => pf_lba <= pf_lba(23 downto 0) & unsigned(rxb);
+                  when 6 =>
+                    pf_lba <= pf_lba(23 downto 0) & unsigned(rxb);
+                    pf_k   <= 0;
+                    pf_off <= 0;
+                    if busy_slot(pf_cur) then
+                      pf_skip <= '1';
+                    else
+                      pf_skip <= '0';
+                      vld_v(to_integer(pf_cur)) := '0';    -- invalid while it is rewritten
+                    end if;
+                  when others =>
+                    if pf_k < pf_count then
+                      if pf_skip = '0' then
+                        rbuf_we <= '1';
+                        rbuf_wa <= ('0' & pf_cur) & to_unsigned(pf_off, 9);
+                        rbuf_wd <= rxb;
+                      end if;
+                      if pf_off = 511 then
+                        -- sector complete: tag it (unless the MEGA65 is writing that LBA)
+                        if pf_skip = '0' and not (wr_req_s(1) = '1' and lba_f = pf_lba) then
+                          tags(to_integer(pf_cur)) <= pf_lba;
+                          vld_v(to_integer(pf_cur)) := '1';
+                          fresh_v(to_integer(pf_cur)) := '1';
+                        end if;
+                        pf_k   <= pf_k + 1;
+                        pf_off <= 0;
+                        pf_lba <= pf_lba + 1;
+                        pf_cur <= pf_cur + 1;
+                        if pf_k + 1 < pf_count then
+                          if busy_slot(pf_cur + 1) then
+                            pf_skip <= '1';
+                          else
+                            pf_skip <= '0';
+                            vld_v(to_integer(pf_cur + 1)) := '0';
+                          end if;
+                        end if;
+                      else
+                        pf_off <= pf_off + 1;
+                      end if;
+                    end if;
+                end case;
 
               when x"11" =>                 -- SD_GET: byte 1 dummy, then data
                 nxt := wbuf_dout;
@@ -647,6 +763,35 @@ begin
           des_tmr <= des_tmr + 1;
         end if;
       end if;
+
+      ------------------------------------------------------------------
+      -- read cache: answer a pending read from a prefetch slot.  Last in the process so
+      -- that vld_v already holds this cycle's prefetch invalidations: a slot that is being
+      -- rewritten can never be picked.  'match' is registered from 'tags', so it lags a new
+      -- tag by up to two cycles: slots tagged this or the last cycle are not used yet.
+      ------------------------------------------------------------------
+      if rd_req_s(1) = '1' and rd_ready_r = '0' and rd_error_r = '0' and demand_busy = '0' then
+        if hit_wait = 0 then
+          hit_i := 16;
+          for i in 15 downto 0 loop
+            if match(i) = '1' and vld_v(i) = '1' and fresh_v(i) = '0' and fresh1(i) = '0' then
+              hit_i := i;
+            end if;
+          end loop;
+          if hit_i /= 16 then
+            act_slot <= to_unsigned(hit_i, 5);
+            hit_wait <= 12;                    -- 12 x 6.2 ns: > 2 cpuclks for act_slot to cross
+            hit_cnt  <= hit_cnt + 1;
+          end if;
+        elsif hit_wait = 1 then
+          rd_ready_r <= '1';
+          hit_wait   <= 0;
+        else
+          hit_wait <= hit_wait - 1;
+        end if;
+      end if;
+      vld    <= vld_v;
+      fresh1 <= fresh_v;
 
     end if;
   end process;
