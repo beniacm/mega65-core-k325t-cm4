@@ -217,6 +217,7 @@ set files [list \
  "[file normalize "$origin_dir/src/vhdl/qmtech-k325t-cm4.vhdl"]"\
  "[file normalize "$origin_dir/src/vhdl/sd_emu.vhdl"]"\
  "[file normalize "$origin_dir/src/vhdl/rk_bridge.vhdl"]"\
+ "[file normalize "$origin_dir/src/vhdl/ddr3_attic.vhdl"]"\
  "[file normalize "$origin_dir/src/vhdl/max10.vhdl"]"\
  "[file normalize "$origin_dir/src/vhdl/keyboard_complex.vhdl"]"\
  "[file normalize "$origin_dir/src/vhdl/virtual_to_matrix.vhdl"]"\
@@ -273,6 +274,13 @@ set files [list \
  "[file normalize "$origin_dir/src/verilog/controller_ds2.v"]"
 ]
 set imported_files [add_files -fileset sources_1 $files]
+
+# MIG 7-series DDR3 controller for the attic RAM. Configuration = the QMTech board's
+# proven MT41K128M16 setup (DDR3-800, 4:1, 200 MHz sys clock) with the MIG's own XADC
+# disabled (fpgatemp owns the only XADC and feeds device_temp_i) and debug ports off.
+create_ip -name mig_7series -vendor xilinx.com -library ip -module_name mig_ddr3
+set_property CONFIG.XML_INPUT_FILE [file normalize "$origin_dir/src/vhdl/qmtech-k325t-cm4_mig_ddr3.prj"] [get_ips mig_ddr3]
+generate_target {instantiation_template synthesis implementation} [get_ips mig_ddr3]
 
 # Set 'sources_1' fileset file properties for remote files
 # None

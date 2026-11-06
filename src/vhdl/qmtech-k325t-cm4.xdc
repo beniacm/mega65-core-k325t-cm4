@@ -82,6 +82,16 @@ create_generated_clock -name clock162 [get_pins clocks/mmcm_adv0/CLKOUT5]
 ## rk_bridge runs in clock162 and talks to the cpuclock side only through
 ## synchronisers / dual-clock RAMs / quasi-static registers.
 set_clock_groups -asynchronous -group [get_clocks clock162] -group [get_clocks clock41]
+## DDR3 attic RAM: clock200 (from the otherwise unused "eth" MMCM) feeds only the MIG;
+## the MIG's ui_clk and PHY clocks are generated from it.  That whole tree meets the
+## cpuclock side only through ddr3_attic's toggle handshakes (payload held stable).
+## (Referencing clocks by the generated tree, not by the MIG's nets, also works while
+## the MIG is still a black box during synthesis.)
+## DDR3 pin LOCs/IOSTANDARDs come from the MIG's generated constraints.
+create_generated_clock -name clock200 [get_pins clocks/mmcm_adv1_eth/CLKOUT2]
+set_clock_groups -asynchronous \
+  -group [get_clocks -include_generated_clocks clock200] \
+  -group [get_clocks {clock41 clock162 clock81p clock27 clock270}]
 create_generated_clock -name clock60  [get_pins AUDIO_TONE/CLOCK/MMCM/CLKOUT1]
 set_false_path -from [get_clocks clock41] -to [get_clocks clock60]
 

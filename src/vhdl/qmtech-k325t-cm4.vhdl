@@ -16,6 +16,8 @@
 --                             serial monitor, keyboard matrix, joysticks, reset.
 --                             Only the 4 spi3 lines are used: the other CM4
 --                             pads may be driven by the Rockchip (BT1120 mux).
+--   DDR3 (bank 34)            256 MB MT41K128M16 via MIG: 8 MB attic RAM
+--                             ($8000000-$87FFFFF), see ddr3_attic.vhdl
 --   SW3  (U26)                CPU reset (active low)
 --   SW2  (V26)                RESTORE (active low)
 --   LED2/3/4 (R26/P26/N26)    status
@@ -73,6 +75,22 @@ entity container is
     rk_cs_n : in  std_logic;
     rk_mosi : in  std_logic;
     rk_miso : out std_logic;
+
+    -- DDR3 (MT41K128M16, bank 34) -- names match the MIG's generated pin constraints.
+    ddr3_dq      : inout std_logic_vector(15 downto 0);
+    ddr3_dqs_p   : inout std_logic_vector(1 downto 0);
+    ddr3_dqs_n   : inout std_logic_vector(1 downto 0);
+    ddr3_addr    : out   std_logic_vector(13 downto 0);
+    ddr3_ba      : out   std_logic_vector(2 downto 0);
+    ddr3_ras_n   : out   std_logic;
+    ddr3_cas_n   : out   std_logic;
+    ddr3_we_n    : out   std_logic;
+    ddr3_reset_n : out   std_logic;
+    ddr3_ck_p    : out   std_logic_vector(0 downto 0);
+    ddr3_ck_n    : out   std_logic_vector(0 downto 0);
+    ddr3_cke     : out   std_logic_vector(0 downto 0);
+    ddr3_dm      : out   std_logic_vector(1 downto 0);
+    ddr3_odt     : out   std_logic_vector(0 downto 0);
 
     -- LEDs (active high).
     led : out std_logic_vector(2 downto 0)
@@ -176,6 +194,67 @@ architecture Behavioral of container is
   signal rk_ctrl_s  : std_logic_vector(7 downto 0) := (others => '0');
   signal monitor_rx, widget_restore_n, widget_capslock_n : std_logic := '1';
 
+  -- DDR3 attic RAM.
+  component mig_ddr3 is
+    port (
+      ddr3_dq             : inout std_logic_vector(15 downto 0);
+      ddr3_dqs_p          : inout std_logic_vector(1 downto 0);
+      ddr3_dqs_n          : inout std_logic_vector(1 downto 0);
+      ddr3_addr           : out   std_logic_vector(13 downto 0);
+      ddr3_ba             : out   std_logic_vector(2 downto 0);
+      ddr3_ras_n          : out   std_logic;
+      ddr3_cas_n          : out   std_logic;
+      ddr3_we_n           : out   std_logic;
+      ddr3_reset_n        : out   std_logic;
+      ddr3_ck_p           : out   std_logic_vector(0 downto 0);
+      ddr3_ck_n           : out   std_logic_vector(0 downto 0);
+      ddr3_cke            : out   std_logic_vector(0 downto 0);
+      ddr3_dm             : out   std_logic_vector(1 downto 0);
+      ddr3_odt            : out   std_logic_vector(0 downto 0);
+      app_addr            : in    std_logic_vector(27 downto 0);
+      app_cmd             : in    std_logic_vector(2 downto 0);
+      app_en              : in    std_logic;
+      app_wdf_data        : in    std_logic_vector(127 downto 0);
+      app_wdf_end         : in    std_logic;
+      app_wdf_mask        : in    std_logic_vector(15 downto 0);
+      app_wdf_wren        : in    std_logic;
+      app_rd_data         : out   std_logic_vector(127 downto 0);
+      app_rd_data_end     : out   std_logic;
+      app_rd_data_valid   : out   std_logic;
+      app_rdy             : out   std_logic;
+      app_wdf_rdy         : out   std_logic;
+      app_sr_req          : in    std_logic;
+      app_ref_req         : in    std_logic;
+      app_zq_req          : in    std_logic;
+      app_sr_active       : out   std_logic;
+      app_ref_ack         : out   std_logic;
+      app_zq_ack          : out   std_logic;
+      ui_clk              : out   std_logic;
+      ui_clk_sync_rst     : out   std_logic;
+      init_calib_complete : out   std_logic;
+      sys_clk_i           : in    std_logic;
+      device_temp_i       : in    std_logic_vector(11 downto 0);
+      sys_rst             : in    std_logic
+    );
+  end component;
+  signal clock200          : std_logic;
+  signal mig_ui_clk        : std_logic;
+  signal mig_ui_rst        : std_logic;
+  signal mig_calib         : std_logic;
+  signal mig_sys_rst_n     : std_logic := '0';
+  signal mig_por           : unsigned(15 downto 0) := (others => '0');
+  signal app_addr          : std_logic_vector(27 downto 0);
+  signal app_cmd           : std_logic_vector(2 downto 0);
+  signal app_en, app_rdy, app_wdf_end, app_wdf_wren, app_wdf_rdy : std_logic;
+  signal app_wdf_data, app_rd_data : std_logic_vector(127 downto 0);
+  signal app_wdf_mask      : std_logic_vector(15 downto 0);
+  signal app_rd_data_valid : std_logic;
+  signal attic_calibrated  : std_logic;
+  signal expansionram_read, expansionram_write : std_logic;
+  signal expansionram_address : unsigned(26 downto 0);
+  signal expansionram_wdata, expansionram_rdata : unsigned(7 downto 0);
+  signal expansionram_data_ready_toggle, expansionram_busy : std_logic;
+
   -- Heartbeat.
   signal heartbeat : unsigned(24 downto 0) := (others => '0');
 
@@ -237,7 +316,56 @@ begin
       clock41  => cpuclock,
       clock81p => pixelclock,
       clock162 => clock162,
-      clock270 => clock270
+      clock270 => clock270,
+      clock200 => clock200
+    );
+
+  -- MIG reset: hold ~1.3 ms after configuration so its input clock is settled.
+  process (clk_in) is
+  begin
+    if rising_edge(clk_in) then
+      if mig_por /= x"FFFF" then
+        mig_por <= mig_por + 1;
+        mig_sys_rst_n <= '0';
+      else
+        mig_sys_rst_n <= '1';
+      end if;
+    end if;
+  end process;
+
+  mig0 : mig_ddr3
+    port map(
+      ddr3_dq => ddr3_dq, ddr3_dqs_p => ddr3_dqs_p, ddr3_dqs_n => ddr3_dqs_n,
+      ddr3_addr => ddr3_addr, ddr3_ba => ddr3_ba, ddr3_ras_n => ddr3_ras_n,
+      ddr3_cas_n => ddr3_cas_n, ddr3_we_n => ddr3_we_n, ddr3_reset_n => ddr3_reset_n,
+      ddr3_ck_p => ddr3_ck_p, ddr3_ck_n => ddr3_ck_n, ddr3_cke => ddr3_cke,
+      ddr3_dm => ddr3_dm, ddr3_odt => ddr3_odt,
+      app_addr => app_addr, app_cmd => app_cmd, app_en => app_en,
+      app_wdf_data => app_wdf_data, app_wdf_end => app_wdf_end, app_wdf_mask => app_wdf_mask,
+      app_wdf_wren => app_wdf_wren, app_rd_data => app_rd_data, app_rd_data_end => open,
+      app_rd_data_valid => app_rd_data_valid, app_rdy => app_rdy, app_wdf_rdy => app_wdf_rdy,
+      app_sr_req => '0', app_ref_req => '0', app_zq_req => '0',
+      app_sr_active => open, app_ref_ack => open, app_zq_ack => open,
+      ui_clk => mig_ui_clk, ui_clk_sync_rst => mig_ui_rst, init_calib_complete => mig_calib,
+      sys_clk_i => clock200,
+      device_temp_i => fpga_temperature,   -- shared XADC (fpgatemp), MIG has none of its own
+      sys_rst => mig_sys_rst_n
+    );
+
+  attic0 : entity work.ddr3_attic
+    generic map(ATTIC_BITS => 23)          -- 8 MB, like a real MEGA65's HyperRAM
+    port map(
+      cpuclk => pixelclock,                -- slow_devices runs on pixelclock (81 MHz)
+      ex_read => expansionram_read, ex_write => expansionram_write,
+      ex_address => expansionram_address, ex_wdata => expansionram_wdata,
+      ex_rdata => expansionram_rdata, ex_data_ready_toggle => expansionram_data_ready_toggle,
+      ex_busy => expansionram_busy,
+      ui_clk => mig_ui_clk, ui_rst => mig_ui_rst, init_calib_complete => mig_calib,
+      app_addr => app_addr, app_cmd => app_cmd, app_en => app_en, app_rdy => app_rdy,
+      app_wdf_data => app_wdf_data, app_wdf_end => app_wdf_end, app_wdf_wren => app_wdf_wren,
+      app_wdf_mask => app_wdf_mask, app_wdf_rdy => app_wdf_rdy, app_rd_data => app_rd_data,
+      app_rd_data_valid => app_rd_data_valid,
+      calibrated => attic_calibrated
     );
 
   fpgatemp0 : entity work.fpgatemp
@@ -399,8 +527,13 @@ begin
       slow_access_wdata          => slow_access_wdata,
       slow_access_rdata          => slow_access_rdata,
 
-      expansionram_data_ready_toggle => '1',
-      expansionram_busy              => '1',
+      expansionram_read              => expansionram_read,
+      expansionram_write             => expansionram_write,
+      expansionram_rdata             => expansionram_rdata,
+      expansionram_wdata             => expansionram_wdata,
+      expansionram_address           => expansionram_address,
+      expansionram_data_ready_toggle => expansionram_data_ready_toggle,
+      expansionram_busy              => expansionram_busy,
 
       cart_nmi   => 'Z',
       cart_irq   => 'Z',
@@ -609,9 +742,9 @@ begin
   h_audio_right <= audio_right when portp_drive(7) = '0' else ((not audio_right(19)) & audio_right(18 downto 0));
   h_audio_left  <= audio_left  when portp_drive(7) = '0' else ((not audio_left (19)) & audio_left (18 downto 0));
 
-  -- LED2: heartbeat, LED3: SYSCTL LED bit, LED4: Rockchip SPI / SD request.
+  -- LED2: heartbeat, LED3: SYSCTL LED bit, LED4: DDR3 calibrated (attic RAM up).
   led(0) <= heartbeat(24);
   led(1) <= portp_drive(4);
-  led(2) <= rk_active or emu_rd_req or emu_wr_req;
+  led(2) <= attic_calibrated;
 
 end Behavioral;
