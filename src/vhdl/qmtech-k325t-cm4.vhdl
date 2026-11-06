@@ -660,8 +660,8 @@ begin
       porta_pins    => porta_pins,
       portb_pins    => portb_pins,
       caps_lock_key => '1',
-      keyleft       => '0',
-      keyup         => '0',
+      keyleft       => rk_ctrl(5),          -- cursor left / up keys from the Rockchip, as the
+      keyup         => rk_ctrl(4),          -- MEGA65 keyboard's dedicated keys (active high)
       fa_fire       => fa_fire,
       fa_up         => fa_up,
       fa_left       => fa_left,
