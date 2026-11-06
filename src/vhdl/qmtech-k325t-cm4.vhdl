@@ -265,6 +265,11 @@ architecture Behavioral of container is
   signal expansionram_address : unsigned(26 downto 0);
   signal expansionram_wdata, expansionram_rdata : unsigned(7 downto 0);
   signal expansionram_data_ready_toggle, expansionram_busy : std_logic;
+  -- attic RAM CPU fast path (as R6: line to the CPU and slow_devices)
+  signal attic_cache_line  : cache_row_t;
+  signal attic_cache_addr  : unsigned(26 downto 3);
+  signal attic_cache_valid : std_logic;
+  signal attic_cache_inc, attic_cache_dec : std_logic;
 
   -- Heartbeat.
   signal heartbeat : unsigned(24 downto 0) := (others => '0');
@@ -392,6 +397,9 @@ begin
       app_wdf_data => app_wdf_data, app_wdf_end => app_wdf_end, app_wdf_wren => app_wdf_wren,
       app_wdf_mask => app_wdf_mask, app_wdf_rdy => app_wdf_rdy, app_rd_data => app_rd_data,
       app_rd_data_valid => app_rd_data_valid,
+      cache_line => attic_cache_line, cache_line_addr => attic_cache_addr,
+      cache_line_valid => attic_cache_valid,
+      cache_next_toggle => attic_cache_inc, cache_prev_toggle => attic_cache_dec,
       calibrated => attic_calibrated
     );
 
@@ -578,7 +586,10 @@ begin
       cart_game  => 'Z',
       cart_io2   => cart_io2,
       cart_d_in  => (others => 'Z'),
-      cart_a     => cart_a
+      cart_a     => cart_a,
+      -- as on R6: line + address, but slow_devices' own cache path stays off
+      expansionram_current_cache_line         => attic_cache_line,
+      expansionram_current_cache_line_address => attic_cache_addr
     );
 
   machine0 : entity work.machine
@@ -607,6 +618,13 @@ begin
       cpu_game             => '1',
       sector_buffer_mapped => sector_buffer_mapped,
       fpga_temperature     => fpga_temperature,
+
+      -- attic RAM CPU fast path
+      slowram_cache_line            => attic_cache_line,
+      slowram_cache_line_valid      => attic_cache_valid,
+      slowram_cache_line_addr       => attic_cache_addr,
+      slowram_cache_line_inc_toggle => attic_cache_inc,
+      slowram_cache_line_dec_toggle => attic_cache_dec,
 
       qspi_clock => qspi_clock,
       qspicsn    => qspi_csn,
