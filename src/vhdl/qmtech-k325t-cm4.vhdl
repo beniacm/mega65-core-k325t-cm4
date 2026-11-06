@@ -119,6 +119,10 @@ architecture Behavioral of container is
   signal qspi_db_oe  : std_logic;
   signal qspi_db_out : unsigned(3 downto 0);
   signal qspi_db_in  : unsigned(3 downto 0);
+  signal qspi_csn_m  : std_logic;          -- the MEGA65's own flash chip select
+  signal qspi_usrclk : std_logic;          -- to STARTUPE2: MEGA65 or Rockchip flash clock
+  -- Rockchip pass-through to the configuration flash (rk_bridge command 0x50)
+  signal rkfl_act, rkfl_sck, rkfl_cs_n, rkfl_mosi : std_logic;
 
   -- SYSCTL configuration register.
   signal portp       : unsigned(7 downto 0);
@@ -318,7 +322,7 @@ begin
       GTS       => '0',
       KEYCLEARB => '0',
       PACK      => '0',
-      USRCCLKO  => qspi_clock,
+      USRCCLKO  => qspi_usrclk,
       USRCCLKTS => '0',
       USRDONEO  => '1',
       USRDONETS => '1'
@@ -537,6 +541,9 @@ begin
       eth_tx_rdata => eth_tx_rdata, eth_tx_pop => eth_tx_pop, eth_tx_drops => eth_tx_drops,
       eth_rx_free => eth_rx_free, eth_rx_we => eth_rx_we, eth_rx_waddr => eth_rx_waddr,
       eth_rx_wdata => eth_rx_wdata, eth_rx_push => eth_rx_push, eth_rx_len => eth_rx_len,
+      flash_active => rkfl_act, flash_sck => rkfl_sck, flash_cs_n => rkfl_cs_n,
+      flash_mosi => rkfl_mosi, flash_miso => qspi_db(1),
+      iprog_toggle => open, iprog_addr => open,   -- MEGA65: reboot via $D6C8..$D6CF
       spi_active => rk_active
     );
 
@@ -627,7 +634,7 @@ begin
       slowram_cache_line_dec_toggle => attic_cache_dec,
 
       qspi_clock => qspi_clock,
-      qspicsn    => qspi_csn,
+      qspicsn    => qspi_csn_m,
       qspidb     => qspi_db_out,
       qspidb_in  => qspi_db_in,
       qspidb_oe  => qspi_db_oe,
@@ -783,7 +790,12 @@ begin
     end if;
   end process;
 
-  qspi_db    <= qspi_db_out when qspi_db_oe = '1' else "ZZZZ";
+  -- Configuration flash: the MEGA65's QSPI controller, or (during a Rockchip 0x50 frame)
+  -- the bridge's x1 SPI pass-through (DQ0 = MOSI, DQ1 = MISO, DQ2/DQ3 = WP#/HOLD# high).
+  qspi_usrclk <= rkfl_sck when rkfl_act = '1' else qspi_clock;
+  qspi_csn    <= rkfl_cs_n when rkfl_act = '1' else qspi_csn_m;
+  qspi_db     <= ('1', '1', 'Z', rkfl_mosi) when rkfl_act = '1' else
+                 qspi_db_out when qspi_db_oe = '1' else "ZZZZ";
   qspi_db_in <= qspi_db;
 
   -- SD in SPI mode: DAT1/DAT2 unused, hold high.

@@ -103,3 +103,9 @@ set_false_path -from [get_clocks clock41] -to [get_clocks clock60]
 set_false_path -from [get_ports {reset_button restore_btn ds1_miso ds2_miso sd_miso rk_sck rk_cs_n rk_mosi}]
 set_false_path -to   [get_ports rk_miso]
 set_false_path -to   [get_ports {led[*]}]
+
+## Rockchip configuration-flash pass-through (rk_bridge 0x50) shares the QSPI pins;
+## a slot that fails to configure falls back to the image at address 0.
+set_property BITSTREAM.CONFIG.CONFIGFALLBACK ENABLE [current_design]
+set_false_path -to   [get_ports {qspi_csn qspi_db[*]}]
+set_false_path -from [get_ports {qspi_db[*]}]

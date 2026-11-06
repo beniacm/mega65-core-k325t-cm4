@@ -49,7 +49,8 @@ use ieee.numeric_std.all;
 
 entity rk_bridge is
   generic (
-    BIT_CLKS : integer := 80
+    BIT_CLKS : integer := 80;
+    CORE_ID  : std_logic_vector(7 downto 0) := x"01"   -- STATUS byte 52: 1 = MEGA65, 2 = C64
   );
   port (
     clk        : in  std_logic;              -- fast bridge clock (162 MHz)
@@ -88,6 +89,15 @@ entity rk_bridge is
     pots           : out std_logic_vector(31 downto 0);
     -- free-form debug bytes, returned by STATUS bytes 20..51 (byte 20 = bits 7..0)
     dbg_ext        : in  std_logic_vector(255 downto 0) := (others => '0');
+    -- configuration flash pass-through (command 0x50), all in clk: SPI mode 0, ~clk/6
+    flash_active   : out std_logic;              -- a 0x50 frame owns the flash pins
+    flash_sck      : out std_logic;              -- to STARTUPE2.USRCCLKO
+    flash_cs_n     : out std_logic;
+    flash_mosi     : out std_logic;              -- DQ0
+    flash_miso     : in  std_logic := '1';       -- DQ1
+    -- reboot into another bitstream (command 0x60): toggles once per request, in clk
+    iprog_toggle   : out std_logic;
+    iprog_addr     : out std_logic_vector(31 downto 0);
     -- Ethernet virtual PHY (eth_vphy, clk side)
     eth_tx_avail   : in  std_logic := '0';
     eth_tx_len     : in  unsigned(10 downto 0) := (others => '0');
@@ -194,6 +204,26 @@ architecture rtl of rk_bridge is
   signal mat     : mat_t := (others => (others => '0'));
   signal pots_r  : std_logic_vector(31 downto 0) := (others => '1');
 
+  -- configuration flash pass-through (0x50): frame = 0x50, len_hi, len_lo, len data bytes,
+  -- then 2 pad bytes; the flash's answer to data byte k comes back in frame byte k + 5.
+  -- 8 clocks with CS high go out first (STARTUPE2 swallows the first USRCCLKO cycles).
+  signal fl_len    : unsigned(15 downto 0) := (others => '0');
+  signal fl_sent   : unsigned(15 downto 0) := (others => '0');
+  signal fl_act    : std_logic := '0';                 -- frame in progress
+  signal fl_busy   : std_logic := '0';                 -- engine shifting a byte
+  signal fl_pre    : std_logic := '0';                 -- shifting the dummy clocks
+  signal fl_tx     : std_logic_vector(7 downto 0) := (others => '1');
+  signal fl_rx     : std_logic_vector(7 downto 0) := (others => '1');
+  signal fl_resp   : std_logic_vector(7 downto 0) := (others => '1');
+  signal fl_phase  : integer range 0 to 5 := 0;
+  signal fl_bit    : integer range 0 to 7 := 0;
+  signal fl_sck_r  : std_logic := '0';
+  signal fl_cs_r   : std_logic := '1';
+  signal fl_ovf    : std_logic := '0';                 -- a byte arrived while busy (sticky)
+  signal fl_last   : std_logic := '0';                 -- release CS after this byte
+  signal ip_addr   : std_logic_vector(31 downto 0) := (others => '0');
+  signal ip_tog    : std_logic := '0';
+
   -- ---------------- cpuclk domain copies ----------------
   signal rd_ready_c, rd_error_c, wr_ack_c : std_logic_vector(1 downto 0) := (others => '0');
   signal mon_rx_c : std_logic_vector(1 downto 0) := (others => '1');
@@ -254,6 +284,12 @@ begin
   eth_tx_raddr <= eth_raddr;
   eth_rx_len   <= eth_rxlen;
   spi_active <= not cs_s(1);
+  flash_active <= fl_act;
+  flash_sck    <= fl_sck_r;
+  flash_cs_n   <= fl_cs_r;
+  flash_mosi   <= fl_tx(7);
+  iprog_toggle <= ip_tog;
+  iprog_addr   <= ip_addr;
   rx_count   <= rxf_wp_d2 - rxf_rp;
   tx_free    <= to_unsigned(1024, 11) - (txf_wp - txf_rp);
 
@@ -321,8 +357,45 @@ begin
       cs_s   <= cs_s(0) & spi_cs_n;
       mosi_s <= mosi_s(0) & spi_mosi;
 
+      ------------------------------------------------------------------
+      -- configuration flash engine: one byte = 8 bits x 6 clocks
+      ------------------------------------------------------------------
+      if fl_busy = '1' then
+        if fl_phase = 5 then
+          fl_phase <= 0;
+          fl_sck_r <= '0';
+          if fl_pre = '0' then
+            fl_rx <= fl_rx(6 downto 0) & flash_miso;     -- sampled at the end of SCK high
+          end if;
+          if fl_bit = 7 then
+            fl_busy <= '0';
+            fl_bit  <= 0;
+            if fl_pre = '0' then
+              fl_resp <= fl_rx(6 downto 0) & flash_miso;
+            end if;
+            fl_pre <= '0';
+            if fl_last = '1' then
+              fl_cs_r <= '1';
+              fl_last <= '0';
+            end if;
+          else
+            fl_bit <= fl_bit + 1;
+            fl_tx  <= fl_tx(6 downto 0) & '1';
+          end if;
+        else
+          if fl_phase = 2 then
+            fl_sck_r <= '1';                         -- flash samples MOSI on this edge
+          end if;
+          fl_phase <= fl_phase + 1;
+        end if;
+      end if;
+
       if cs_s(1) = '1' then
         -- end of a transaction (bidx still holds its byte count here)
+        if fl_busy = '0' and fl_last = '0' then
+          fl_cs_r <= '1';
+          fl_act  <= '0';
+        end if;
         if cs_prev = '0' then
           if cmd = x"40" and bidx >= 2 and eth_tx_avail = '1'
              and (bidx - 2) >= ("0" & eth_tx_len) then
@@ -396,6 +469,8 @@ begin
                   when 18 => nxt := "0000" & std_logic_vector(eth_rx_free);
                   when 19 => nxt := std_logic_vector(eth_tx_drops);
                   when 20 to 51 => nxt := dbg_ext(8 * (st - 20) + 7 downto 8 * (st - 20));
+                  when 52 => nxt := CORE_ID;
+                  when 53 => nxt := "0000000" & fl_ovf;
                   when others => nxt := x"00";
                 end case;
 
@@ -443,6 +518,46 @@ begin
                   eth_rx_waddr <= resize(bidx - 3, 11);
                   eth_rx_wdata <= rxb;
                 end if;
+
+              when x"50" =>                 -- FLASH: len_hi, len_lo, data..., 2 pads
+                if bidx = 1 then
+                  fl_len(15 downto 8) <= unsigned(rxb);
+                  fl_act  <= '1';
+                  fl_sent <= (others => '0');
+                  fl_ovf  <= '0';
+                  -- dummy clocks with CS high
+                  fl_cs_r <= '1'; fl_pre <= '1'; fl_busy <= '1'; fl_tx <= x"FF";
+                  fl_phase <= 0; fl_bit <= 0;
+                elsif bidx = 2 then
+                  fl_len(7 downto 0) <= unsigned(rxb);
+                else
+                  if fl_sent < fl_len then
+                    if fl_busy = '1' then
+                      fl_ovf <= '1';
+                    end if;
+                    fl_tx    <= rxb;
+                    fl_cs_r  <= '0';
+                    fl_busy  <= '1';
+                    fl_phase <= 0;
+                    fl_bit   <= 0;
+                    fl_pre   <= '0';
+                    fl_sent  <= fl_sent + 1;
+                    if fl_sent + 1 = fl_len then
+                      fl_last <= '1';
+                    end if;
+                  end if;
+                  nxt := fl_resp;
+                end if;
+
+              when x"60" =>                 -- IPROG: addr(31..24) .. addr(7..0), $A5
+                case to_integer(bidx) is
+                  when 1 => ip_addr(31 downto 24) <= rxb;
+                  when 2 => ip_addr(23 downto 16) <= rxb;
+                  when 3 => ip_addr(15 downto 8)  <= rxb;
+                  when 4 => ip_addr(7 downto 0)   <= rxb;
+                  when 5 => if rxb = x"A5" then ip_tog <= not ip_tog; end if;
+                  when others => null;
+                end case;
 
               when x"30" =>                 -- INPUT
                 case to_integer(bidx) is

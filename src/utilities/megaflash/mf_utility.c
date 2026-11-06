@@ -35,8 +35,15 @@ int8_t mfut_probe_hardware_version(void)
   uint8_t k = 0;
 
   hw_model_id = PEEK(0xD629);
-  hw_model_minor = (hw_model_id >> 4) & 0xf;
-  hw_model_id &= 0xf;
+  // Only the MEGA65 boards (ids $01..$0f) carry a minor revision in the high nibble;
+  // MEGAphone ($2x), Nexys ($4x), QMTECH ($6x) and Wukong ($FD) ids are whole bytes --
+  // splitting e.g. QMTECH A325T $62 gave model 2 (MEGA65 R2, 4 MB slots) instead of 8 MB.
+  if (hw_model_id < 0x20) {
+    hw_model_minor = (hw_model_id >> 4) & 0xf;
+    hw_model_id &= 0xf;
+  }
+  else
+    hw_model_minor = 0;
 
 #define MFUT_BUF2MOD(A) (((mega_models_t *)buffer)->A)
 
