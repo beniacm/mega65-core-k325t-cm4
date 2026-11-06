@@ -186,7 +186,11 @@ begin
   -------------------------------------------------------------------------
   app_addr     <= "0" & std_logic_vector(resize(u_addr(ATTIC_BITS - 1 downto 4), 24)) & "000";
   app_cmd      <= CMD_WR when st = S_WR else CMD_RD;
-  app_en       <= '1' when (st = S_RD) or (st = S_WR and cmd_ok = '0') else '0';
+  -- Writes: data first, command once the data is (being) taken.  UG586 allows the data
+  -- at most two cycles after its command, which app_wdf_rdy back-pressure could break.
+  app_en       <= '1' when (st = S_RD) or
+                           (st = S_WR and cmd_ok = '0' and (dat_ok = '1' or app_wdf_rdy = '1'))
+                  else '0';
   app_wdf_wren <= '1' when st = S_WR and dat_ok = '0' else '0';
   app_wdf_end  <= '1' when st = S_WR and dat_ok = '0' else '0';
   gen_wdata : for i in 0 to 15 generate
@@ -220,13 +224,14 @@ begin
             end if;
 
           when S_WR =>
-            if app_rdy = '1' and cmd_ok = '0' then
+            if app_rdy = '1' and cmd_ok = '0' and (dat_ok = '1' or app_wdf_rdy = '1') then
               cmd_ok <= '1';
             end if;
             if app_wdf_rdy = '1' and dat_ok = '0' then
               dat_ok <= '1';
             end if;
-            if (cmd_ok = '1' or app_rdy = '1') and (dat_ok = '1' or app_wdf_rdy = '1') then
+            if (cmd_ok = '1' or (app_rdy = '1' and (dat_ok = '1' or app_wdf_rdy = '1'))) and
+               (dat_ok = '1' or app_wdf_rdy = '1') then
               st <= S_DONE;
             end if;
 

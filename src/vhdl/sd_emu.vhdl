@@ -27,6 +27,13 @@ use ieee.std_logic_1164.all;
 use ieee.numeric_std.all;
 
 entity sd_emu is
+  generic (
+    -- false: SD bus in the SAME clock domain as clk (MEGA65 controller).
+    -- true:  SD bus from another clock domain (e.g. M2M's SimpleSDHC on its
+    --        25 MHz clock): cs/sclk/mosi pass 2-FF synchronisers first.
+    --        clk must be >= ~8x the SCLK rate (100 MHz for 12.5 MHz SCLK).
+    SYNC_IN : boolean := false
+  );
   port (
     clk      : in  std_logic;
     -- SD SPI bus from the MEGA65 controller
@@ -103,8 +110,43 @@ architecture rtl of sd_emu is
   signal ack_l    : std_logic := '0';
   signal cmd_count_r : unsigned(7 downto 0) := (others => '0');
   signal last_cmd_r  : unsigned(7 downto 0) := (others => '0');
+  signal crc16       : std_logic_vector(15 downto 0) := (others => '0');
+
+  signal cs_in, sclk_in, mosi_in : std_logic;
+  signal in_s1, in_s2 : std_logic_vector(2 downto 0) := "011";
+  attribute ASYNC_REG : string;
+  attribute ASYNC_REG of in_s1, in_s2 : signal is "TRUE";
+
+  -- CRC16-CCITT (x^16+x^12+x^5+1, init 0, MSB first) of the data block, as a
+  -- real card sends it; M2M's SimpleSDHC enables CRC (CMD59) and checks it.
+  function crc16_byte(c : std_logic_vector(15 downto 0); b : std_logic_vector(7 downto 0))
+    return std_logic_vector is
+    variable r : std_logic_vector(15 downto 0) := c;
+    variable f : std_logic;
+  begin
+    for i in 7 downto 0 loop
+      f := r(15) xor b(i);
+      r := r(14 downto 0) & '0';
+      if f = '1' then r := r xor x"1021"; end if;
+    end loop;
+    return r;
+  end function;
 
 begin
+
+  gen_direct : if not SYNC_IN generate
+    cs_in <= sd_cs_n; sclk_in <= sd_sclk; mosi_in <= sd_mosi;
+  end generate;
+  gen_sync : if SYNC_IN generate
+    process (clk)
+    begin
+      if rising_edge(clk) then
+        in_s1 <= sd_cs_n & sd_sclk & sd_mosi;
+        in_s2 <= in_s1;
+      end if;
+    end process;
+    cs_in <= in_s2(2); sclk_in <= in_s2(1); mosi_in <= in_s2(0);
+  end generate;
 
   sd_miso   <= miso_r;
   rd_req    <= rd_req_r;
@@ -136,15 +178,15 @@ begin
   begin
     if rising_edge(clk) then
       wbuf_we <= '0';
-      sclk_d  <= sd_sclk;
-      cs_d    <= sd_cs_n;
+      sclk_d  <= sclk_in;
+      cs_d    <= cs_in;
       if wr_ack = '1' then
         ack_l <= '1';
       end if;
 
-      ev := (sd_sclk = '1' and sclk_d = '0');
+      ev := (sclk_in = '1' and sclk_d = '0');
 
-      if sd_cs_n = '1' and cs_d = '0' then
+      if cs_in = '1' and cs_d = '0' then
         -- Deselect: abandon whatever was going on.
         mode     <= M_IDLE;
         miso_r   <= '1';
@@ -156,13 +198,13 @@ begin
           when M_IDLE | M_CMD =>
             miso_r <= '1';
             if mode = M_IDLE then
-              if sd_mosi = '0' then        -- start bit of a command
-                cmd_sr  <= cmd_sr(46 downto 0) & sd_mosi;
+              if mosi_in = '0' then        -- start bit of a command
+                cmd_sr  <= cmd_sr(46 downto 0) & mosi_in;
                 cmd_cnt <= 1;
                 mode    <= M_CMD;
               end if;
             else
-              full := cmd_sr(46 downto 0) & sd_mosi;
+              full := cmd_sr(46 downto 0) & mosi_in;
               cmd_sr <= full;
               if cmd_cnt /= 47 then
                 cmd_cnt <= cmd_cnt + 1;
@@ -251,11 +293,11 @@ begin
             end if;
 
           when M_RD_WAIT | M_RD_DATA =>
-            if sd_mosi = '0' then
+            if mosi_in = '0' then
               -- Host abandoned the read and is sending a new command.
               rd_req_r <= '0';
               miso_r   <= '1';
-              cmd_sr   <= cmd_sr(46 downto 0) & sd_mosi;
+              cmd_sr   <= cmd_sr(46 downto 0) & mosi_in;
               cmd_cnt  <= 1;
               mode     <= M_CMD;
             elsif tx_left /= 0 then
@@ -271,6 +313,7 @@ begin
               elsif rd_ready = '1' then
                 load_byte(x"FE");        -- start token
                 idx  <= (others => '0'); -- prefetch byte 0
+                crc16 <= (others => '0');
                 mode <= M_RD_DATA;
               else
                 load_byte(x"FF");
@@ -278,9 +321,13 @@ begin
             else
               if idx < 512 then
                 load_byte(rbuf_data);
+                crc16 <= crc16_byte(crc16, rbuf_data);
                 idx <= idx + 1;
-              elsif idx < 514 then
-                load_byte(x"FF");        -- CRC (ignored by the controller)
+              elsif idx = 512 then
+                load_byte(crc16(15 downto 8));   -- CRC16 (the MEGA65 ignores it)
+                idx <= idx + 1;
+              elsif idx = 513 then
+                load_byte(crc16(7 downto 0));
                 idx <= idx + 1;
               else
                 rd_req_r <= '0';
@@ -302,7 +349,7 @@ begin
 
           when M_W_RX =>
             miso_r <= '1';
-            byte_v := rx_sr(6 downto 0) & sd_mosi;
+            byte_v := rx_sr(6 downto 0) & mosi_in;
             rx_sr  <= byte_v;
             if wsub = W_TOKEN then
               -- Token search uses a sliding window, not byte alignment: the
@@ -310,7 +357,7 @@ begin
               -- blocks of a CMD25, but none before the stop token.
               -- Single block: FE.  Multi block: FC (data) / FD (stop).
               -- Neither can false-match inside 0xFF..token sequences.
-              byte_v := tok_sr(6 downto 0) & sd_mosi;
+              byte_v := tok_sr(6 downto 0) & mosi_in;
               tok_sr <= byte_v;
               rx_cnt <= 0;
               if (multi = '0' and byte_v = x"FE") or (multi = '1' and byte_v = x"FC") then

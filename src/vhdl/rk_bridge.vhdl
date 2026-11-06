@@ -84,6 +84,10 @@ entity rk_bridge is
     joya           : out std_logic_vector(4 downto 0);   -- active high
     joyb           : out std_logic_vector(4 downto 0);
     ctrl           : out std_logic_vector(7 downto 0);
+    -- paddles / 1351 mouse: pot1 x, pot1 y, pot2 x, pot2 y (INPUT bytes 13..16), $FF = open
+    pots           : out std_logic_vector(31 downto 0);
+    -- free-form debug bytes, returned by STATUS bytes 20..51 (byte 20 = bits 7..0)
+    dbg_ext        : in  std_logic_vector(255 downto 0) := (others => '0');
     -- Ethernet virtual PHY (eth_vphy, clk side)
     eth_tx_avail   : in  std_logic := '0';
     eth_tx_len     : in  unsigned(10 downto 0) := (others => '0');
@@ -188,6 +192,7 @@ architecture rtl of rk_bridge is
   signal joya_r  : std_logic_vector(4 downto 0) := (others => '0');
   signal joyb_r  : std_logic_vector(4 downto 0) := (others => '0');
   signal mat     : mat_t := (others => (others => '0'));
+  signal pots_r  : std_logic_vector(31 downto 0) := (others => '1');
 
   -- ---------------- cpuclk domain copies ----------------
   signal rd_ready_c, rd_error_c, wr_ack_c : std_logic_vector(1 downto 0) := (others => '0');
@@ -195,11 +200,12 @@ architecture rtl of rk_bridge is
   signal mat_c1, mat_c2 : mat_t := (others => (others => '0'));
   signal ctrl_c1, ctrl_c2 : std_logic_vector(7 downto 0) := (others => '0');
   signal joya_c1, joya_c2, joyb_c1, joyb_c2 : std_logic_vector(4 downto 0) := (others => '0');
+  signal pots_c1, pots_c2, pots_c : std_logic_vector(31 downto 0) := (others => '1');
 
   attribute ASYNC_REG : string;
   attribute ASYNC_REG of rd_req_s, wr_req_s, inited_s, rd_ready_c, rd_error_c,
     wr_ack_c, mon_rx_c, mat_c1, mat_c2, ctrl_c1, ctrl_c2, joya_c1, joya_c2,
-    joyb_c1, joyb_c2, sck_s, cs_s, mosi_s : signal is "TRUE";
+    joyb_c1, joyb_c2, pots_c1, pots_c2, sck_s, cs_s, mosi_s : signal is "TRUE";
 
 begin
 
@@ -221,6 +227,11 @@ begin
       ctrl_c1 <= ctrl_r; ctrl_c2 <= ctrl_c1;
       joya_c1 <= joya_r; joya_c2 <= joya_c1;
       joyb_c1 <= joyb_r; joyb_c2 <= joyb_c1;
+      -- multi-bit value: take it only once two successive samples agree (no torn bytes)
+      pots_c1 <= pots_r; pots_c2 <= pots_c1;
+      if pots_c2 = pots_c1 then
+        pots_c <= pots_c2;
+      end if;
     end if;
   end process;
 
@@ -231,6 +242,7 @@ begin
   ctrl        <= ctrl_c2;
   joya        <= joya_c2;
   joyb        <= joyb_c2;
+  pots        <= pots_c;
   -- The keymapper samples the column combinationally while it scans
   -- (a registered lookup shifts every key one column up).
   matrix_col  <= not mat_c2(matrix_col_idx) when matrix_col_idx <= 8 else (others => '1');
@@ -383,6 +395,7 @@ begin
                   when 17 => if eth_tx_avail = '1' then nxt := std_logic_vector(eth_tx_len(7 downto 0)); end if;
                   when 18 => nxt := "0000" & std_logic_vector(eth_rx_free);
                   when 19 => nxt := std_logic_vector(eth_tx_drops);
+                  when 20 to 51 => nxt := dbg_ext(8 * (st - 20) + 7 downto 8 * (st - 20));
                   when others => nxt := x"00";
                 end case;
 
@@ -437,6 +450,10 @@ begin
                   when 2 => joya_r <= rxb(4 downto 0);
                   when 3 => joyb_r <= rxb(4 downto 0);
                   when 4 to 12 => mat(to_integer(bidx) - 4) <= rxb;
+                  when 13 => pots_r(31 downto 24) <= rxb;   -- pot1 x
+                  when 14 => pots_r(23 downto 16) <= rxb;   -- pot1 y
+                  when 15 => pots_r(15 downto 8)  <= rxb;   -- pot2 x
+                  when 16 => pots_r(7 downto 0)   <= rxb;   -- pot2 y
                   when others => null;
                 end case;
 
