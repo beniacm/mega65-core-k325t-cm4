@@ -18,6 +18,8 @@
 --                             pads may be driven by the Rockchip (BT1120 mux).
 --   DDR3 (bank 34)            256 MB MT41K128M16 via MIG: 8 MB attic RAM
 --                             ($8000000-$87FFFFF), see ddr3_attic.vhdl
+--   Ethernet                  MEGA65 MAC <-> eth_vphy (virtual RMII PHY) <-> rk_bridge
+--                             <-> Rockchip TAP interface (m65io) -> LAN (routed/NAT)
 --   SW3  (U26)                CPU reset (active low)
 --   SW2  (V26)                RESTORE (active low)
 --   LED2/3/4 (R26/P26/N26)    status
@@ -238,6 +240,15 @@ architecture Behavioral of container is
     );
   end component;
   signal clock200          : std_logic;
+  signal clock50           : std_logic;   -- RMII clock (same MMCM as clock200 = 4x)
+  signal clock200_u, clock50_u : std_logic;  -- unbuffered MMCM outputs
+  signal eth_txd_s, eth_rxd_s : unsigned(1 downto 0);
+  signal eth_txen_s, eth_rxdv_s : std_logic;
+  signal eth_tx_avail, eth_tx_pop, eth_rx_we, eth_rx_push : std_logic;
+  signal eth_tx_len, eth_tx_raddr, eth_rx_waddr, eth_rx_len : unsigned(10 downto 0);
+  signal eth_tx_rdata, eth_rx_wdata : std_logic_vector(7 downto 0);
+  signal eth_tx_drops : unsigned(7 downto 0);
+  signal eth_rx_free : unsigned(3 downto 0);
   signal mig_ui_clk        : std_logic;
   signal mig_ui_rst        : std_logic;
   signal mig_calib         : std_logic;
@@ -317,7 +328,23 @@ begin
       clock81p => pixelclock,
       clock162 => clock162,
       clock270 => clock270,
-      clock200 => clock200
+      clock200 => clock200_u,
+      clock50  => clock50_u
+    );
+
+  -- Explicit global buffers: clock200 feeds the MIG's IDELAYCTRL (must be a BUFG,
+  -- DRC PLIDC-9) and the Ethernet MAC; clock50 is the MAC/eth_vphy RMII clock.
+  bufg200 : BUFG port map (I => clock200_u, O => clock200);
+  bufg50  : BUFG port map (I => clock50_u,  O => clock50);
+
+  ethphy0 : entity work.eth_vphy
+    port map(
+      clk50 => clock50, clkb => clock162,
+      mac_txd => eth_txd_s, mac_txen => eth_txen_s, mac_rxd => eth_rxd_s, mac_rxdv => eth_rxdv_s,
+      tx_avail => eth_tx_avail, tx_len => eth_tx_len, tx_raddr => eth_tx_raddr,
+      tx_rdata => eth_tx_rdata, tx_pop => eth_tx_pop, tx_drops => eth_tx_drops,
+      rx_free => eth_rx_free, rx_we => eth_rx_we, rx_waddr => eth_rx_waddr,
+      rx_wdata => eth_rx_wdata, rx_push => eth_rx_push, rx_len_in => eth_rx_len
     );
 
   -- MIG reset: hold ~1.3 ms after configuration so its input clock is settled.
@@ -498,6 +525,10 @@ begin
       mon_rx => mon_rx, mon_tx => uart_txd_int,
       matrix_col_idx => widget_idx, matrix_col => widget_col,
       joya => rk_joya, joyb => rk_joyb, ctrl => rk_ctrl,
+      eth_tx_avail => eth_tx_avail, eth_tx_len => eth_tx_len, eth_tx_raddr => eth_tx_raddr,
+      eth_tx_rdata => eth_tx_rdata, eth_tx_pop => eth_tx_pop, eth_tx_drops => eth_tx_drops,
+      eth_rx_free => eth_rx_free, eth_rx_we => eth_rx_we, eth_rx_waddr => eth_rx_waddr,
+      eth_rx_wdata => eth_rx_wdata, eth_rx_push => eth_rx_push, eth_rx_len => eth_rx_len,
       spi_active => rk_active
     );
 
@@ -561,9 +592,9 @@ begin
       cpuclock             => cpuclock,
       uartclock            => cpuclock,
       clock162             => '0',
-      clock200             => '0',
+      clock200             => clock200,
       clock27              => clock27,
-      clock50mhz           => '0',
+      clock50mhz           => clock50,
       no_hyppo             => '0',
       kbd_datestamp        => (others => '0'),
       kbd_commit           => (others => '0'),
@@ -648,9 +679,11 @@ begin
       f_writeprotect    => '1',
       f_rdata           => '1',
       f_diskchanged     => '1',
-      eth_rxd           => "00",
+      eth_rxd           => eth_rxd_s,
+      eth_txd           => eth_txd_s,
+      eth_txen          => eth_txen_s,
       eth_rxer          => '0',
-      eth_rxdv          => '0',
+      eth_rxdv          => eth_rxdv_s,
       eth_interrupt     => '0',
       aclMISO           => '1',
       aclInt1           => '1',

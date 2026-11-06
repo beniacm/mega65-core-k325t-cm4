@@ -16,6 +16,10 @@
 --   0x13 SD_RERR  : cmd             -> pending read is out of range (error token)
 --   0x20 UART_PUT : cmd, N bytes    -> MEGA65 serial monitor input (RsRx)
 --   0x21 UART_GET : cmd, dummy, N bytes of monitor output (0x00 when empty)
+--   0x40 ETH_TXGET: cmd, dummy, frame bytes (MAC -> Rockchip; length from STATUS
+--                   16-17). The frame is released at CS rise once it was fully read.
+--   0x41 ETH_RXPUT: cmd, len_hi, len_lo, frame bytes incl. FCS (Rockchip -> MAC);
+--                   committed at CS rise if exactly len bytes arrived and a slot is free.
 --   0x30 INPUT    : cmd, ctrl, joyA, joyB, col0..col8   (all active high)
 --                   ctrl: b0 hold CPU reset, b1 RESTORE, b2 CAPS LOCK,
 --                         b3 use physical J12 SD instead of the emulator
@@ -26,6 +30,8 @@
 --   0 'M'(0x4D) 1 0x65 2 version 3 flags 4 sd seq 5..8 sd lba (BE)
 --   9..10 uart rx count (BE) 11..12 uart tx free (BE) 13 sd cmd count
 --   14 last sd cmd (b7 = ACMD) 15 ctrl readback
+--   16..17 next Ethernet frame MAC->Rockchip, length (BE, 0 = none)
+--   18 free Ethernet RX slots   19 Ethernet frames dropped (no free TX slot)
 --   flags: b0 rd_req b1 rd_ready b2 wr_req b3 sd inited b4 uart rx overflow
 --          b5 rd_error
 --
@@ -78,6 +84,19 @@ entity rk_bridge is
     joya           : out std_logic_vector(4 downto 0);   -- active high
     joyb           : out std_logic_vector(4 downto 0);
     ctrl           : out std_logic_vector(7 downto 0);
+    -- Ethernet virtual PHY (eth_vphy, clk side)
+    eth_tx_avail   : in  std_logic := '0';
+    eth_tx_len     : in  unsigned(10 downto 0) := (others => '0');
+    eth_tx_raddr   : out unsigned(10 downto 0);
+    eth_tx_rdata   : in  std_logic_vector(7 downto 0) := (others => '0');
+    eth_tx_pop     : out std_logic;
+    eth_tx_drops   : in  unsigned(7 downto 0) := (others => '0');
+    eth_rx_free    : in  unsigned(3 downto 0) := (others => '0');
+    eth_rx_we      : out std_logic;
+    eth_rx_waddr   : out unsigned(10 downto 0);
+    eth_rx_wdata   : out std_logic_vector(7 downto 0);
+    eth_rx_push    : out std_logic;
+    eth_rx_len     : out unsigned(10 downto 0);
     -- activity
     spi_active     : out std_logic
   );
@@ -85,7 +104,7 @@ end entity;
 
 architecture rtl of rk_bridge is
 
-  constant VERSION : std_logic_vector(7 downto 0) := x"02";
+  constant VERSION : std_logic_vector(7 downto 0) := x"03";
 
   type ram512_t  is array (0 to 511)  of std_logic_vector(7 downto 0);
   type ram1k_t   is array (0 to 1023) of std_logic_vector(7 downto 0);
@@ -104,7 +123,7 @@ architecture rtl of rk_bridge is
   signal mosi_s : std_logic_vector(1 downto 0) := (others => '0');
   signal rx_sr  : std_logic_vector(6 downto 0) := (others => '0');
   signal bitcnt : integer range 0 to 7 := 0;
-  signal bidx   : unsigned(9 downto 0) := (others => '0');  -- byte index, saturating
+  signal bidx   : unsigned(11 downto 0) := (others => '0');  -- byte index, saturating (Ethernet frames up to 1518 + 3 bytes)
   signal cmd    : std_logic_vector(7 downto 0) := (others => '0');
   signal miso_r : std_logic := '0';
   signal tx_sr  : std_logic_vector(6 downto 0) := (others => '0');
@@ -158,6 +177,11 @@ architecture rtl of rk_bridge is
   signal des_tmr   : integer range 0 to BIT_CLKS-1 := 0;
   signal des_bits  : integer range 0 to 9 := 0;
   signal des_sr    : std_logic_vector(7 downto 0) := (others => '0');
+
+  -- Ethernet
+  signal eth_raddr  : unsigned(10 downto 0) := (others => '0');
+  signal eth_rxlen  : unsigned(10 downto 0) := (others => '0');
+  signal cs_prev    : std_logic := '1';
 
   -- input registers
   signal ctrl_r  : std_logic_vector(7 downto 0) := (others => '0');
@@ -215,6 +239,8 @@ begin
   -- fast side
   -------------------------------------------------------------------------
   spi_miso   <= miso_r;
+  eth_tx_raddr <= eth_raddr;
+  eth_rx_len   <= eth_rxlen;
   spi_active <= not cs_s(1);
   rx_count   <= rxf_wp_d2 - rxf_rp;
   tx_free    <= to_unsigned(1024, 11) - (txf_wp - txf_rp);
@@ -241,11 +267,15 @@ begin
   process (clk)
     variable rxb   : std_logic_vector(7 downto 0);
     variable nxt   : std_logic_vector(7 downto 0);
-    variable st    : integer range 0 to 1023;
-    variable put_i : integer range 0 to 1023;
+    variable st    : integer range 0 to 4095;
+    variable put_i : integer range 0 to 4095;
   begin
     if rising_edge(clk) then
       rbuf_we   <= '0';
+      eth_tx_pop  <= '0';
+      eth_rx_we   <= '0';
+      eth_rx_push <= '0';
+      cs_prev   <= cs_s(1);
       txf_we    <= '0';
       rxf_we    <= '0';
       rxf_wp_d  <= rxf_wp;
@@ -280,6 +310,17 @@ begin
       mosi_s <= mosi_s(0) & spi_mosi;
 
       if cs_s(1) = '1' then
+        -- end of a transaction (bidx still holds its byte count here)
+        if cs_prev = '0' then
+          if cmd = x"40" and bidx >= 2 and eth_tx_avail = '1'
+             and (bidx - 2) >= ("0" & eth_tx_len) then
+            eth_tx_pop <= '1';
+          end if;
+          if cmd = x"41" and bidx >= 3 and eth_rxlen /= 0 and eth_rx_free /= 0
+             and (bidx - 3) = ("0" & eth_rxlen) then
+            eth_rx_push <= '1';
+          end if;
+        end if;
         bitcnt <= 0;
         bidx   <= (others => '0');
         miso_r <= '0';
@@ -303,7 +344,7 @@ begin
             rxf_rp <= rxf_rp + 1;
           end if;
           cur_from_fifo <= '0';
-          if bidx /= 1023 then
+          if bidx /= 4095 then
             bidx <= bidx + 1;
           end if;
 
@@ -311,6 +352,7 @@ begin
             cmd <= rxb;
             case rxb is
               when x"11" => wbuf_raddr <= (others => '0');   -- prefetch
+              when x"40" => eth_raddr  <= (others => '0');   -- prefetch
               when x"12" => wr_ack_r   <= wr_req_s(1);
               when x"13" => rd_error_r <= rd_req_s(1);
               when others => null;
@@ -337,6 +379,10 @@ begin
                   when 13 => nxt := std_logic_vector(ccnt_f);
                   when 14 => nxt := std_logic_vector(lcmd_f);
                   when 15 => nxt := ctrl_r;
+                  when 16 => if eth_tx_avail = '1' then nxt := "00000" & std_logic_vector(eth_tx_len(10 downto 8)); end if;
+                  when 17 => if eth_tx_avail = '1' then nxt := std_logic_vector(eth_tx_len(7 downto 0)); end if;
+                  when 18 => nxt := "0000" & std_logic_vector(eth_rx_free);
+                  when 19 => nxt := std_logic_vector(eth_tx_drops);
                   when others => nxt := x"00";
                 end case;
 
@@ -368,6 +414,21 @@ begin
                   nxt := rxf_dout;
                   rxf_pp <= rxf_pp + 1;
                   cur_from_fifo <= '1';
+                end if;
+
+              when x"40" =>                 -- ETH_TXGET: byte 1 dummy, then data
+                nxt := eth_tx_rdata;
+                eth_raddr <= eth_raddr + 1;
+
+              when x"41" =>                 -- ETH_RXPUT: len_hi, len_lo, data
+                if bidx = 1 then
+                  eth_rxlen(10 downto 8) <= unsigned(rxb(2 downto 0));
+                elsif bidx = 2 then
+                  eth_rxlen(7 downto 0) <= unsigned(rxb);
+                elsif eth_rx_free /= 0 and bidx - 3 < 2048 then
+                  eth_rx_we    <= '1';
+                  eth_rx_waddr <= resize(bidx - 3, 11);
+                  eth_rx_wdata <= rxb;
                 end if;
 
               when x"30" =>                 -- INPUT

@@ -89,8 +89,12 @@ set_clock_groups -asynchronous -group [get_clocks clock162] -group [get_clocks c
 ## the MIG is still a black box during synthesis.)
 ## DDR3 pin LOCs/IOSTANDARDs come from the MIG's generated constraints.
 create_generated_clock -name clock200 [get_pins clocks/mmcm_adv1_eth/CLKOUT2]
+## clock50 = RMII clock of the MEGA65 MAC + eth_vphy, same MMCM as clock200 (MAC needs 4x).
+## The MAC crosses into cpuclock internally (as on real boards); eth_vphy meets the bridge
+## (clock162) only through toggle handshakes and dual-clock RAMs.
+create_generated_clock -name clock50 [get_pins clocks/mmcm_adv1_eth/CLKOUT1]
 set_clock_groups -asynchronous \
-  -group [get_clocks -include_generated_clocks clock200] \
+  -group [get_clocks -include_generated_clocks {clock200 clock50}] \
   -group [get_clocks {clock41 clock162 clock81p clock27 clock270}]
 create_generated_clock -name clock60  [get_pins AUDIO_TONE/CLOCK/MMCM/CLKOUT1]
 set_false_path -from [get_clocks clock41] -to [get_clocks clock60]

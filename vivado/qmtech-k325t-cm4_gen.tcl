@@ -218,6 +218,7 @@ set files [list \
  "[file normalize "$origin_dir/src/vhdl/sd_emu.vhdl"]"\
  "[file normalize "$origin_dir/src/vhdl/rk_bridge.vhdl"]"\
  "[file normalize "$origin_dir/src/vhdl/ddr3_attic.vhdl"]"\
+ "[file normalize "$origin_dir/src/vhdl/eth_vphy.vhdl"]"\
  "[file normalize "$origin_dir/src/vhdl/max10.vhdl"]"\
  "[file normalize "$origin_dir/src/vhdl/keyboard_complex.vhdl"]"\
  "[file normalize "$origin_dir/src/vhdl/virtual_to_matrix.vhdl"]"\
