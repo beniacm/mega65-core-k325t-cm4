@@ -78,6 +78,10 @@ create_generated_clock -name clock81p [get_pins clocks/mmcm_adv0/CLKOUT2]
 create_generated_clock -name clock41  [get_pins clocks/mmcm_adv0/CLKOUT3]
 create_generated_clock -name clock27  [get_pins clocks/mmcm_adv0/CLKOUT4]
 create_generated_clock -name clock270 [get_pins clocks/mmcm_adv0/CLKOUT6]
+create_generated_clock -name clock162 [get_pins clocks/mmcm_adv0/CLKOUT5]
+## rk_bridge runs in clock162 and talks to the cpuclock side only through
+## synchronisers / dual-clock RAMs / quasi-static registers.
+set_clock_groups -asynchronous -group [get_clocks clock162] -group [get_clocks clock41]
 create_generated_clock -name clock60  [get_pins AUDIO_TONE/CLOCK/MMCM/CLKOUT1]
 set_false_path -from [get_clocks clock41] -to [get_clocks clock60]
 

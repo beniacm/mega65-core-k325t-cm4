@@ -90,6 +90,7 @@ architecture Behavioral of container is
   signal pixelclock           : std_logic;
   signal clock27              : std_logic;
   signal clock270             : std_logic;
+  signal clock162             : std_logic;  -- rk_bridge fast clock (4 x cpuclock)
   signal sector_buffer_mapped : std_logic;
   signal fpga_temperature     : std_logic_vector(11 downto 0) := (others => '0');
 
@@ -235,6 +236,7 @@ begin
       clock27  => clock27,
       clock41  => cpuclock,
       clock81p => pixelclock,
+      clock162 => clock162,
       clock270 => clock270
     );
 
@@ -356,8 +358,9 @@ begin
     );
 
   rkbridge0 : entity work.rk_bridge
+    generic map(BIT_CLKS => 80)          -- 162 MHz / 2.025 Mbaud
     port map(
-      clk => cpuclock,
+      clk => clock162, cpuclk => cpuclock,
       spi_sck => rk_sck, spi_cs_n => rk_cs_n, spi_mosi => rk_mosi, spi_miso => rk_miso,
       sd_rd_req => emu_rd_req, sd_wr_req => emu_wr_req, sd_lba => emu_lba, sd_seq => emu_seq,
       sd_inited => emu_inited, sd_cmd_cnt => emu_ccnt, sd_last_cmd => emu_lcmd,
