@@ -1,5 +1,5 @@
 --------------------------------------------------------------------------------
--- ddr3_attic.vhdl -- MEGA65 "attic" expansion RAM ($8000000-$87FFFFF) on DDR3.
+-- ddr3_attic.vhdl -- MEGA65 "attic" expansion RAM ($8000000-...) on DDR3.
 --
 -- Presents the slow_devices expansion-RAM byte interface (the one the
 -- hyperram/sdram controllers implement on real MEGA65 boards) on top of a
@@ -16,17 +16,25 @@
 --   ui_clk side (MIG): one masked 16-byte write or one 16-byte read per
 --     request; the byte is selected by address(3:0) on both paths.
 --
--- Size: ATTIC_BITS address bits are used (23 = 8 MB, like the HyperRAM of a
--- real MEGA65); higher addresses mirror.  The DDR3 holds 256 MB, so this can
--- grow to the interface's 128 MB by raising ATTIC_BITS to 27.
+-- Size: after reset the attic is COMPAT_BITS wide (23 = 8 MB, the HyperRAM of a real
+-- MEGA65) and mirrors above, so unmodified software sees exactly what it expects.
+-- Software that knows the board unlocks the full ATTIC_BITS (26 = 64 MB on the K325T;
+-- the DDR3 holds 256 MB, the interface allows 27 = 128 MB) with the size register:
+--   $BFFFFFC  write 64 = 64 MB (2^ATTIC_BITS / 1 MB), anything else = 8 MB;
+--             read = current size in MB (8 or 64).  Any CPU reset returns to 8 MB.
+--   from BASIC 65:  POKE $BFFFFFC,64 : PRINT PEEK($BFFFFFC)
+-- $BFFFFF0-$BFFFFFF are controller registers in both sizes, as on the real MEGA65
+-- (its HyperRAM controller's registers sit there; it ignores writes to $BFFFFFC, where
+-- it reads back a cache address byte).  The other 15 read 0 and ignore writes, so in
+-- 64 MB mode the top 16 bytes of the attic are not RAM.
 --
 -- CPU fast path (as the sdram/hyperram controllers of real boards): every
 -- completed read publishes its 8-byte line (cache_line/_addr/_valid); the
 -- CPU reads hits straight from it, and its inc/dec toggles ask for a silent
 -- read of the next/previous line (published, but no data_ready_toggle).
 -- Writes to the published line update it in place (write-through); the
--- match is on the PHYSICAL address (ATTIC_BITS), so a write through an 8 MB
--- mirror alias keeps a line cached under another alias coherent.
+-- match is on the PHYSICAL address (ATTIC_BITS), so a write through a mirror
+-- alias keeps a line cached under another alias coherent.
 --
 -- Clock crossing: request = toggle + payload held stable (payload is
 -- captured in ui_clk only after the toggle has passed a 2-FF synchroniser);
@@ -39,11 +47,13 @@ use work.cputypes.all;
 
 entity ddr3_attic is
   generic (
-    ATTIC_BITS : integer := 23
+    ATTIC_BITS  : integer := 23;      -- full size (address bits)
+    COMPAT_BITS : integer := 23       -- size after reset (8 MB, like a real MEGA65)
   );
   port (
     -- slow_devices expansion RAM interface (cpuclk)
     cpuclk            : in  std_logic;
+    reset_n           : in  std_logic := '1';   -- CPU reset (any clock): back to COMPAT_BITS
     ex_read           : in  std_logic;
     ex_write          : in  std_logic;
     ex_address        : in  unsigned(26 downto 0);
@@ -97,6 +107,33 @@ architecture rtl of ddr3_attic is
   signal line_valid_r : std_logic := '0';
   signal next_s, prev_s : std_logic_vector(1 downto 0) := (others => '0');
   signal next_seen, prev_seen : std_logic := '0';
+  signal big          : std_logic := '0';     -- '1' = ATTIC_BITS, '0' = COMPAT_BITS
+  signal req_big      : std_logic := '0';
+  signal rst_s        : std_logic_vector(1 downto 0) := (others => '1');
+
+  constant SIZE_MB : integer := 2 ** (ATTIC_BITS - 20);
+  constant COMPAT_MB : integer := 2 ** (COMPAT_BITS - 20);
+
+  -- $BFFFFF0-$BFFFFFF (expansion address $3FFFFFx, bit 26 ignored as in hyperram.vhdl)
+  function is_reg(a : unsigned(26 downto 0)) return boolean is
+  begin
+    return a(25 downto 4) = (25 downto 4 => '1');
+  end function;
+  function is_reg_line(l : unsigned(26 downto 3)) return boolean is
+  begin
+    return l(25 downto 4) = (25 downto 4 => '1');
+  end function;
+  -- physical address bits of the current size (for the write-through alias match)
+  function phys(a : unsigned(26 downto 3); b : std_logic) return unsigned is
+    variable r : unsigned(26 downto 3) := a;
+  begin
+    if b = '1' then
+      r(26 downto ATTIC_BITS) := (others => '0');
+    else
+      r(26 downto COMPAT_BITS) := (others => '0');
+    end if;
+    return r;
+  end function;
 
   -- ui_clk domain
   type st_t is (S_IDLE, S_WR, S_RD, S_RDW, S_DONE);
@@ -104,6 +141,7 @@ architecture rtl of ddr3_attic is
   signal req_u      : std_logic_vector(2 downto 0) := (others => '0');
   signal u_write    : std_logic := '0';
   signal u_addr     : unsigned(26 downto 0) := (others => '0');
+  signal u_big      : std_logic := '0';
   signal u_wdata    : std_logic_vector(7 downto 0) := (others => '0');
   signal cmd_ok     : std_logic := '0';
   signal dat_ok     : std_logic := '0';
@@ -111,7 +149,7 @@ architecture rtl of ddr3_attic is
   signal rdata_u    : std_logic_vector(63 downto 0) := (others => '0');  -- 8-byte half
 
   attribute ASYNC_REG : string;
-  attribute ASYNC_REG of ack_c, calib_c, req_u, next_s, prev_s : signal is "TRUE";
+  attribute ASYNC_REG of ack_c, calib_c, req_u, next_s, prev_s, rst_s : signal is "TRUE";
 
 begin
 
@@ -133,9 +171,44 @@ begin
       ack_c   <= ack_c(1 downto 0) & ack_toggle;
       next_s  <= next_s(0) & cache_next_toggle;
       prev_s  <= prev_s(0) & cache_prev_toggle;
+      rst_s   <= rst_s(0) & reset_n;
 
-      if busy_c = '0' and calib_c(1) = '1' and (ex_read = '1' or ex_write = '1') then
+      if rst_s(1) = '0' then
+        -- CPU reset: back to the real MEGA65's size (the mirrors change meaning)
+        if big = '1' then
+          line_valid_r <= '0';
+        end if;
+        big <= '0';
+      end if;
+
+      if busy_c = '0' and calib_c(1) = '1' and (ex_read = '1' or ex_write = '1')
+         and is_reg(ex_address) then
+        -- controller registers: answered at once, no DDR3 access
+        if ex_write = '1' then
+          if ex_address(3 downto 0) = x"C" then
+            if to_integer(ex_wdata) = SIZE_MB then
+              big <= '1';
+              if big = '0' then line_valid_r <= '0'; end if;
+            else
+              big <= '0';
+              if big = '1' then line_valid_r <= '0'; end if;
+            end if;
+          end if;
+        else
+          if ex_address(3 downto 0) = x"C" then
+            if big = '1' then
+              ex_rdata <= to_unsigned(SIZE_MB, 8);
+            else
+              ex_rdata <= to_unsigned(COMPAT_MB, 8);
+            end if;
+          else
+            ex_rdata <= x"00";
+          end if;
+          ready_toggle <= not ready_toggle;
+        end if;
+      elsif busy_c = '0' and calib_c(1) = '1' and (ex_read = '1' or ex_write = '1') then
         req_write  <= ex_write;
+        req_big    <= big;
         req_addr   <= ex_address;
         req_wdata  <= ex_wdata;
         req_silent <= '0';
@@ -143,13 +216,15 @@ begin
         busy_c     <= '1';
         -- write-through: keep the published line coherent (physical match)
         if ex_write = '1' and line_valid_r = '1'
-           and ex_address(ATTIC_BITS - 1 downto 3) = line_addr_r(ATTIC_BITS - 1 downto 3) then
+           and phys(ex_address(26 downto 3), big) = phys(line_addr_r, big) then
           line_r(to_integer(ex_address(2 downto 0))) <= ex_wdata;
         end if;
       elsif busy_c = '0' and calib_c(1) = '1' and line_valid_r = '1'
             and (next_s(1) /= next_seen or prev_s(1) /= prev_seen) then
-        -- CPU asks for the next / previous line: silent prefetch read
+        -- CPU asks for the next / previous line: silent prefetch read (never into the
+        -- register line, which must not be published as RAM)
         req_write  <= '0';
+        req_big    <= big;
         if next_s(1) /= next_seen then
           req_addr <= (line_addr_r + 1) & "000";
         else
@@ -158,8 +233,11 @@ begin
         next_seen  <= next_s(1);
         prev_seen  <= prev_s(1);
         req_silent <= '1';
-        req_toggle <= not req_toggle;
-        busy_c     <= '1';
+        if (next_s(1) /= next_seen and not is_reg_line(line_addr_r + 1)) or
+           (next_s(1) = next_seen and not is_reg_line(line_addr_r - 1)) then
+          req_toggle <= not req_toggle;
+          busy_c     <= '1';
+        end if;
       elsif busy_c = '1' and ack_c(2) /= ack_c(1) then
         -- request finished in the ui_clk domain (rdata_u stable since then)
         busy_c <= '0';
@@ -169,6 +247,9 @@ begin
           end loop;
           line_addr_r  <= req_addr(26 downto 3);
           line_valid_r <= '1';
+          if req_big /= big then
+            line_valid_r <= '0';            -- the size changed while this read was in flight
+          end if;
           if req_silent = '0' then
             byte_i := to_integer(req_addr(2 downto 0));
             ex_rdata     <= unsigned(rdata_u(8 * byte_i + 7 downto 8 * byte_i));
@@ -184,7 +265,9 @@ begin
   -- are tracked separately so each write issues exactly one command and one
   -- data beat even when app_rdy and app_wdf_rdy assert on different cycles.
   -------------------------------------------------------------------------
-  app_addr     <= "0" & std_logic_vector(resize(u_addr(ATTIC_BITS - 1 downto 4), 24)) & "000";
+  app_addr     <= "0" & std_logic_vector(resize(u_addr(ATTIC_BITS - 1 downto 4), 24)) & "000"
+                  when u_big = '1' else
+                  "0" & std_logic_vector(resize(u_addr(COMPAT_BITS - 1 downto 4), 24)) & "000";
   app_cmd      <= CMD_WR when st = S_WR else CMD_RD;
   -- Writes: data first, command once the data is (being) taken.  UG586 allows the data
   -- at most two cycles after its command, which app_wdf_rdy back-pressure could break.
@@ -215,6 +298,7 @@ begin
               -- payload has been stable since before the toggle was synchronised
               u_write <= req_write;
               u_addr  <= req_addr;
+              u_big   <= req_big;
               u_wdata <= std_logic_vector(req_wdata);
               if req_write = '1' then
                 st <= S_WR;

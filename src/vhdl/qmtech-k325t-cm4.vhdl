@@ -16,8 +16,8 @@
 --                             serial monitor, keyboard matrix, joysticks, reset.
 --                             Only the 4 spi3 lines are used: the other CM4
 --                             pads may be driven by the Rockchip (BT1120 mux).
---   DDR3 (bank 34)            256 MB MT41K128M16 via MIG: 8 MB attic RAM
---                             ($8000000-$87FFFFF), see ddr3_attic.vhdl
+--   DDR3 (bank 34)            256 MB MT41K128M16 via MIG: attic RAM, 8 MB after reset
+--                             (as a real MEGA65), 64 MB after POKE $BFFFFFC,64; see ddr3_attic.vhdl
 --   Ethernet                  MEGA65 MAC <-> eth_vphy (virtual RMII PHY) <-> rk_bridge
 --                             <-> Rockchip TAP interface (m65io) -> LAN (routed/NAT)
 --   SW3  (U26)                CPU reset (active low)
@@ -389,9 +389,11 @@ begin
     );
 
   attic0 : entity work.ddr3_attic
-    generic map(ATTIC_BITS => 23)          -- 8 MB, like a real MEGA65's HyperRAM
+    generic map(ATTIC_BITS => 26,          -- 64 MB once unlocked ($BFFFFFC <- 64) ...
+                COMPAT_BITS => 23)         -- ... 8 MB + mirrors after reset, like a real MEGA65
     port map(
       cpuclk => pixelclock,                -- slow_devices runs on pixelclock (81 MHz)
+      reset_n => reset_out,                -- CPU reset -> back to 8 MB
       ex_read => expansionram_read, ex_write => expansionram_write,
       ex_address => expansionram_address, ex_wdata => expansionram_wdata,
       ex_rdata => expansionram_rdata, ex_data_ready_toggle => expansionram_data_ready_toggle,
