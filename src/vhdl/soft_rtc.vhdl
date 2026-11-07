@@ -10,7 +10,12 @@
 --   $FFD7113 day      $FFD7114 month    $FFD7115 year (20yy)  $FFD7116 day of week (0..6)
 -- $FFD71F0 XCTL: K325T extension control, cleared by every reset (a real MEGA65 again):
 --   bit 0 = 1 MB chip RAM for the CPU/DMA, bit 1 = raster DMA list on,
---   bit 2 = 64 KB colour RAM (VIC-IV, via xctl_out)
+--   bit 2 = 64 KB colour RAM (VIC-IV, via xctl_out), bit 3 = 24 extra sprites (VIC-IV),
+--   bit 4 = fast RRB (VIC-IV paints 2 pixels per cycle)
+-- $FFD7120-$FFD71DF: extra sprite registers, 8 bytes per sprite (see viciv.vhdl "extra
+--   sprites"): X lo, X bit 8, Y lo, Y bit 8, pointer lo, pointer hi, colour, flags
+-- $FFD71E0/E1: extra sprite X / Y alignment offsets (signed)
+--   ($FFD7120-$FFD71EF is a plain RAM here; the VIC-IV reads it through xs_raddr/xs_rdata)
 -- $FFD71F4-$FFD71F7: raster DMA list address (28 bits, little endian)
 -- (gs4510 snoops these writes and acts on them; the copies here are for reading back)
 -- All other addresses of the $FFD71xx page read 0.  Until the first write it reads an
@@ -31,7 +36,10 @@ entity soft_rtc is
     fastio_read  : in  std_logic;
     fastio_wdata : in  unsigned(7 downto 0);
     fastio_rdata : out unsigned(7 downto 0);
-    xctl_out     : out unsigned(7 downto 0)
+    xctl_out     : out unsigned(7 downto 0);
+    -- extra sprite registers for the VIC-IV (asynchronous read, any clock)
+    xs_raddr     : in  unsigned(7 downto 0) := x"00";
+    xs_rdata     : out unsigned(7 downto 0)
   );
 end entity;
 
@@ -42,7 +50,9 @@ architecture rtl of soft_rtc is
   signal dow            : unsigned(7 downto 0) := x"00";
   signal tick_cnt       : integer range 0 to clock_frequency - 1 := 0;
   signal xctl           : unsigned(7 downto 0) := x"00";       -- $FFD71F0
-  constant XCTL_BITS    : unsigned(7 downto 0) := x"07";       -- implemented bits
+  constant XCTL_BITS    : unsigned(7 downto 0) := x"1F";       -- implemented bits
+  type xsram_t is array (0 to 255) of unsigned(7 downto 0);
+  signal xsram          : xsram_t := (others => x"00");        -- $FFD7120-$FFD71EF used
   type rdl_t is array (0 to 3) of unsigned(7 downto 0);
   signal rdma_list      : rdl_t := (others => x"00");          -- $FFD71F4-7
 
@@ -77,7 +87,9 @@ begin
   xctl_out <= xctl;
 
   -- reads: combinational onto the shared fastio bus, 'Z' when not selected
-  process (cs, fastio_read, fastio_addr, sec, min, hour, day, month, year, dow, xctl, rdma_list) is
+  xs_rdata <= xsram(to_integer(xs_raddr));
+
+  process (cs, fastio_read, fastio_addr, sec, min, hour, day, month, year, dow, xctl, rdma_list, xsram) is
   begin
     if cs = '1' and fastio_read = '1' then
       case fastio_addr(7 downto 0) is
@@ -93,7 +105,12 @@ begin
         when x"F5" => fastio_rdata <= rdma_list(1);
         when x"F6" => fastio_rdata <= rdma_list(2);
         when x"F7" => fastio_rdata <= rdma_list(3) and x"0F";
-        when others => fastio_rdata <= x"00";
+        when others =>
+          if fastio_addr(7 downto 0) >= x"20" and fastio_addr(7 downto 0) <= x"EF" then
+            fastio_rdata <= xsram(to_integer(fastio_addr(7 downto 0)));
+          else
+            fastio_rdata <= x"00";
+          end if;
       end case;
     else
       fastio_rdata <= (others => 'Z');
@@ -108,6 +125,10 @@ begin
         xctl <= x"00";
       elsif cs = '1' and fastio_write = '1' and fastio_addr(7 downto 0) = x"F0" then
         xctl <= fastio_wdata and XCTL_BITS;
+      end if;
+      if cs = '1' and fastio_write = '1' and fastio_addr(7 downto 0) >= x"20"
+         and fastio_addr(7 downto 0) <= x"EF" then
+        xsram(to_integer(fastio_addr(7 downto 0))) <= fastio_wdata;
       end if;
       if cs = '1' and fastio_write = '1' and fastio_addr(7 downto 2) = "111101" then
         rdma_list(to_integer(fastio_addr(1 downto 0))) <= fastio_wdata;
