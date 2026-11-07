@@ -155,6 +155,9 @@ set files [list \
  "[file normalize "$origin_dir/src/vhdl/mega65r5_board_i2c.vhdl"]"\
  "[file normalize "$origin_dir/src/vhdl/grove_i2c.vhdl"]"\
  "[file normalize "$origin_dir/src/vhdl/soft_rtc.vhdl"]"\
+ "[file normalize "$origin_dir/src/vhdl/linux_fb.vhdl"]"\
+ "[file normalize "$origin_dir/src/verilog/bt1120_rx.v"]"\
+ "[file normalize "$origin_dir/src/verilog/bt1120_video.v"]"\
  "[file normalize "$origin_dir/src/vhdl/mfm_bits_to_bytes.vhdl"]"\
  "[file normalize "$origin_dir/src/vhdl/mfm_bits_to_gaps.vhdl"]"\
  "[file normalize "$origin_dir/src/vhdl/mfm_decoder.vhdl"]"\
@@ -336,6 +339,10 @@ set file_obj [get_files -of_objects [get_filesets sources_1] [list "*$file"]]
 set_property -name "file_type" -value "VHDL" -objects $file_obj
 
 set file "vhdl/soft_rtc.vhdl"
+set file_obj [get_files -of_objects [get_filesets sources_1] [list "*$file"]]
+set_property -name "file_type" -value "VHDL" -objects $file_obj
+
+set file "vhdl/linux_fb.vhdl"
 set file_obj [get_files -of_objects [get_filesets sources_1] [list "*$file"]]
 set_property -name "file_type" -value "VHDL" -objects $file_obj
 
@@ -1017,6 +1024,9 @@ set obj [get_runs synth_1]
 set_property -name "needs_refresh" -value "1" -objects $obj
 set_property -name "part" -value "xc7k325tffg676-1" -objects $obj
 set_property -name "strategy" -value "Vivado Synthesis Defaults" -objects $obj
+# K325T: more global clock buffers than synth_design's default of 12 may infer (the BT1120
+# clock of linux_fb is one more; with 12 the 27 MHz HDMI clock was left on local routing)
+set_property -name "steps.synth_design.args.bufg" -value "24" -objects $obj
 
 # set the current synth run
 current_run -synthesis [get_runs synth_1]

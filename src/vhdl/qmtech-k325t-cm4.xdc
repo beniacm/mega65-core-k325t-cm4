@@ -68,8 +68,35 @@ set_property -dict {PACKAGE_PIN B9  IOSTANDARD LVCMOS33 DRIVE 8 SLEW FAST} [get_
 ## and the MISO register sit in the I/O cells, so pad delays are fixed and short whatever the
 ## placement of the rest (a build with MISO placed far from B9 lost the link above 25 MHz).
 set_property IOB TRUE [get_ports {rk_sck rk_mosi rk_cs_n rk_miso}]
-##   Nothing else on the CM4 bus is used: pads such as GPIO3_A7/C2/C3 come up
-##   muxed to BT1120 video OUTPUT from the Rockchip boot DTB.
+## The Rockchip's own picture: BT1120 (clock + 16 data) from the boot DTB's vp2 output
+## (rockchip/boot_dtb, 720x576@50 = 27 MHz), pins from the board bring-up (PINMAP.md,
+## bt1120_hdmi.xdc, verified to 74.25 MHz there).  Inputs only.
+set_property -dict {PACKAGE_PIN B10 IOSTANDARD LVCMOS33} [get_ports bt_clk]
+create_clock -period 13.468 -name bt_clk [get_ports bt_clk]
+## B10 is not a clock-capable pin: route it to its BUFG through the fabric, as the bring-up
+## design did (pixel-clean there up to 74.25 MHz; here 27 MHz).
+set_property CLOCK_DEDICATED_ROUTE FALSE [get_nets -of_objects [get_pins -hier -filter {NAME =~ *btclk_bufg/I}]]
+set_property -dict {PACKAGE_PIN A14 IOSTANDARD LVCMOS33} [get_ports {bt_d[0]}]
+set_property -dict {PACKAGE_PIN B14 IOSTANDARD LVCMOS33} [get_ports {bt_d[1]}]
+set_property -dict {PACKAGE_PIN A13 IOSTANDARD LVCMOS33} [get_ports {bt_d[2]}]
+set_property -dict {PACKAGE_PIN A12 IOSTANDARD LVCMOS33} [get_ports {bt_d[3]}]
+set_property -dict {PACKAGE_PIN B12 IOSTANDARD LVCMOS33} [get_ports {bt_d[4]}]
+set_property -dict {PACKAGE_PIN C9  IOSTANDARD LVCMOS33} [get_ports {bt_d[5]}]
+set_property -dict {PACKAGE_PIN D16 IOSTANDARD LVCMOS33} [get_ports {bt_d[6]}]
+set_property -dict {PACKAGE_PIN E10 IOSTANDARD LVCMOS33} [get_ports {bt_d[7]}]
+set_property -dict {PACKAGE_PIN A10 IOSTANDARD LVCMOS33} [get_ports {bt_d[8]}]
+set_property -dict {PACKAGE_PIN D18 IOSTANDARD LVCMOS33} [get_ports {bt_d[9]}]
+set_property -dict {PACKAGE_PIN C18 IOSTANDARD LVCMOS33} [get_ports {bt_d[10]}]
+set_property -dict {PACKAGE_PIN B11 IOSTANDARD LVCMOS33} [get_ports {bt_d[11]}]
+set_property -dict {PACKAGE_PIN C12 IOSTANDARD LVCMOS33} [get_ports {bt_d[12]}]
+set_property -dict {PACKAGE_PIN C13 IOSTANDARD LVCMOS33} [get_ports {bt_d[13]}]
+set_property -dict {PACKAGE_PIN D14 IOSTANDARD LVCMOS33} [get_ports {bt_d[14]}]
+set_property -dict {PACKAGE_PIN D13 IOSTANDARD LVCMOS33} [get_ports {bt_d[15]}]
+set_false_path -from [get_ports {bt_d[*]}]
+## bt_clk is unrelated to the core's clocks; linux_fb crosses via a dual-clock BRAM and a
+## 2-FF synchroniser for the select bit.
+set_clock_groups -asynchronous -group [get_clocks -include_generated_clocks bt_clk]
+## (No other CM4 line is used; the boot DTB's BT1120 mux drives exactly these pads.)
 
 ## QSPI configuration flash (S25FL128L); CCLK is driven via STARTUPE2.
 set_property -dict {PACKAGE_PIN B24 IOSTANDARD LVCMOS33 PULLUP TRUE} [get_ports {qspi_db[0]}]

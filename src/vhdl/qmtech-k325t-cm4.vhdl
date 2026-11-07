@@ -50,6 +50,10 @@ entity container is
     tmds_clk_p  : out std_logic;
     tmds_clk_n  : out std_logic;
 
+    -- The Rockchip's own picture: BT1120 on the CM4 bus (rockchip/boot_dtb), 720x576@50.
+    bt_clk      : in  std_logic;                       -- B10 (GPIO3_A6)
+    bt_d        : in  std_logic_vector(15 downto 0);
+
     -- QSPI configuration flash (S25FL128L).
     qspi_db  : inout unsigned(3 downto 0);
     qspi_csn : out   std_logic;
@@ -177,6 +181,13 @@ architecture Behavioral of container is
   signal v_green         : unsigned(7 downto 0);
   signal v_blue          : unsigned(7 downto 0);
   signal hdmi_dataenable : std_logic;
+  -- linux_fb: the Rockchip's picture as the alternative HDMI source (bridge 0x70 VIDEO)
+  signal bt_clk_b        : std_logic;
+  signal video_sel       : std_logic_vector(7 downto 0);
+  signal video_diag      : std_logic_vector(31 downto 0);
+  signal video_diag2     : std_logic_vector(63 downto 0);
+  signal lf_de, lf_hs, lf_vs : std_logic;
+  signal lf_r, lf_g, lf_b    : unsigned(7 downto 0);
   signal tmds            : slv_9_0_t(0 to 2);
   signal tmds_pin        : slv_9_0_t(0 to 2);
 
@@ -434,6 +445,21 @@ begin
       pcm_r               => pcm_r
     );
 
+  -- The Rockchip's picture in its own video buffer; shown instead of the core's picture
+  -- when the Rockchip sets bridge VIDEO bit 0 (m65ctl view linux).  Same 576p timing,
+  -- so switching is seamless.
+  btclk_bufg : BUFG port map (I => bt_clk, O => bt_clk_b);
+  linuxfb0 : entity work.linux_fb
+    port map (
+      bt_clk => bt_clk_b, bt_d => bt_d,
+      clk27 => clock27, show_linux => video_sel(0), cap_rise => video_sel(1), diag => video_diag,
+      diag2 => video_diag2,
+      in_de => hdmi_dataenable, in_hs => v_hdmi_hsync, in_vs => v_vsync,
+      in_r => v_red, in_g => v_green, in_b => v_blue,
+      out_de => lf_de, out_hs => lf_hs, out_vs => lf_vs,
+      out_r => lf_r, out_g => lf_g, out_b => lf_b,
+      linux_locked => open);
+
   hdmi0 : entity work.vga_to_hdmi
     port map(
       select_44100 => '0',
@@ -446,12 +472,12 @@ begin
 
       vga_rst => dvi_reset,
       vga_clk => clock27,
-      vga_vs  => v_vsync,
-      vga_hs  => v_hdmi_hsync,
-      vga_de  => hdmi_dataenable,
-      vga_r   => std_logic_vector(v_red),
-      vga_g   => std_logic_vector(v_green),
-      vga_b   => std_logic_vector(v_blue),
+      vga_vs  => lf_vs,
+      vga_hs  => lf_hs,
+      vga_de  => lf_de,
+      vga_r   => std_logic_vector(lf_r),
+      vga_g   => std_logic_vector(lf_g),
+      vga_b   => std_logic_vector(lf_b),
 
       pcm_rst   => pcm_rst,
       pcm_clk   => pcm_clk,
@@ -546,6 +572,9 @@ begin
       flash_active => rkfl_act, flash_sck => rkfl_sck, flash_cs_n => rkfl_cs_n,
       flash_mosi => rkfl_mosi, flash_miso => qspi_db(1),
       iprog_toggle => open, iprog_addr => open,   -- MEGA65: reboot via $D6C8..$D6CF
+      video_sel => video_sel,                     -- 0x70 VIDEO: picture source
+      video_diag => video_diag,                   -- STATUS 60..63: linux_fb diagnostics
+      video_diag2 => video_diag2,                 -- STATUS 64..71: raw BT1120 bus statistics
       spi_active => rk_active
     );
 

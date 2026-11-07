@@ -27,6 +27,14 @@
 --                   16-17). The frame is released at CS rise once it was fully read.
 --   0x41 ETH_RXPUT: cmd, len_hi, len_lo, frame bytes incl. FCS (Rockchip -> MAC);
 --                   committed at CS rise if exactly len bytes arrived and a slot is free.
+--   0x70 VIDEO    : cmd, sel        -> HDMI picture source: b0 = 1 the Rockchip's own picture
+--                   (BT1120 -> linux_fb video buffer), 0 = the core's picture (K325T)
+--                   b1 = sample the BT1120 data on the rising clock edge (else falling)
+--                   STATUS 59 = sel; 60..63 = linux_fb diagnostics (BT1120 clock domain):
+--                   frames seen (8) | lines of the last frame (12) | b3 rising edge, b2 data
+--                   enable seen, b1 YC swapped, b0 locked | pixels of the last line / 16
+--                   64..71 = raw bus per 2^20-clock window: data lines seen high (16), seen
+--                   low (16), FF words on the low / high byte (8+8), BT1120 clock count / 65536
 --   0x30 INPUT    : cmd, ctrl, joyA, joyB, col0..col8   (all active high)
 --                   ctrl: b0 hold CPU reset, b1 RESTORE, b2 CAPS LOCK,
 --                         b3 use physical J12 SD instead of the emulator
@@ -42,7 +50,7 @@
 --   flags: b0 rd_req b1 rd_ready b2 wr_req b3 sd inited b4 uart rx overflow
 --          b5 rd_error
 --   52 core id  53 flash overrun  54..55 prefetch valid bitmap (BE)  56..57 prefetch hits
---   (BE, wraps)  58 slot the emulator reads (16 = the SD_PUT slot)
+--   (BE, wraps)  58 slot the emulator reads (16 = the SD_PUT slot)  59 VIDEO sel readback
 -- Read cache (v4): 16 prefetch slots + 1 demand slot (SD_PUT) in one 16 KB block RAM.  While
 -- a read is pending and unanswered, its LBA is compared with the 16 tags; on a hit the
 -- emulator is switched to that slot and rd_ready rises after a short settle time (the slot
@@ -109,6 +117,9 @@ entity rk_bridge is
     flash_miso     : in  std_logic := '1';       -- DQ1
     -- reboot into another bitstream (command 0x60): toggles once per request, in clk
     iprog_toggle   : out std_logic;
+    video_sel      : out std_logic_vector(7 downto 0) := x"00";   -- 0x70 VIDEO (clk domain)
+    video_diag     : in  std_logic_vector(31 downto 0) := (others => '0');  -- STATUS 60..63 (async, diagnostic)
+    video_diag2    : in  std_logic_vector(63 downto 0) := (others => '0');  -- STATUS 64..71 (async, diagnostic)
     iprog_addr     : out std_logic_vector(31 downto 0);
     -- Ethernet virtual PHY (eth_vphy, clk side)
     eth_tx_avail   : in  std_logic := '0';
@@ -253,6 +264,7 @@ architecture rtl of rk_bridge is
   signal fl_last   : std_logic := '0';                 -- release CS after this byte
   signal ip_addr   : std_logic_vector(31 downto 0) := (others => '0');
   signal ip_tog    : std_logic := '0';
+  signal vid_r     : std_logic_vector(7 downto 0) := x"00";   -- 0x70 VIDEO
 
   -- ---------------- cpuclk domain copies ----------------
   signal rd_ready_c, rd_error_c, wr_ack_c : std_logic_vector(1 downto 0) := (others => '0');
@@ -321,6 +333,7 @@ begin
   flash_cs_n   <= fl_cs_r;
   flash_mosi   <= fl_tx(7);
   iprog_toggle <= ip_tog;
+  video_sel    <= vid_r;
   iprog_addr   <= ip_addr;
   rx_count   <= rxf_wp_d2 - rxf_rp;
   tx_free    <= to_unsigned(1024, 11) - (txf_wp - txf_rp);
@@ -536,6 +549,19 @@ begin
                   when 56 => nxt := std_logic_vector(hit_cnt(15 downto 8));
                   when 57 => nxt := std_logic_vector(hit_cnt(7 downto 0));
                   when 58 => nxt := "000" & std_logic_vector(act_slot);
+                  when 59 => nxt := vid_r;
+                  when 60 => nxt := video_diag(31 downto 24);
+                  when 61 => nxt := video_diag(23 downto 16);
+                  when 62 => nxt := video_diag(15 downto 8);
+                  when 63 => nxt := video_diag(7 downto 0);
+                  when 64 => nxt := video_diag2(63 downto 56);
+                  when 65 => nxt := video_diag2(55 downto 48);
+                  when 66 => nxt := video_diag2(47 downto 40);
+                  when 67 => nxt := video_diag2(39 downto 32);
+                  when 68 => nxt := video_diag2(31 downto 24);
+                  when 69 => nxt := video_diag2(23 downto 16);
+                  when 70 => nxt := video_diag2(15 downto 8);
+                  when 71 => nxt := video_diag2(7 downto 0);
                   when others => nxt := x"00";
                 end case;
 
@@ -671,6 +697,11 @@ begin
                   when 5 => if rxb = x"A5" then ip_tog <= not ip_tog; end if;
                   when others => null;
                 end case;
+
+              when x"70" =>                 -- VIDEO: picture source
+                if to_integer(bidx) = 1 then
+                  vid_r <= rxb;
+                end if;
 
               when x"30" =>                 -- INPUT
                 case to_integer(bidx) is
