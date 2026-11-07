@@ -156,6 +156,7 @@ set files [list \
  "[file normalize "$origin_dir/src/vhdl/grove_i2c.vhdl"]"\
  "[file normalize "$origin_dir/src/vhdl/soft_rtc.vhdl"]"\
  "[file normalize "$origin_dir/src/vhdl/linux_fb.vhdl"]"\
+ "[file normalize "$origin_dir/src/vhdl/rrb_list_expander.vhdl"]"\
  "[file normalize "$origin_dir/src/verilog/bt1120_rx.v"]"\
  "[file normalize "$origin_dir/src/verilog/bt1120_video.v"]"\
  "[file normalize "$origin_dir/src/vhdl/mfm_bits_to_bytes.vhdl"]"\
@@ -343,6 +344,10 @@ set file_obj [get_files -of_objects [get_filesets sources_1] [list "*$file"]]
 set_property -name "file_type" -value "VHDL" -objects $file_obj
 
 set file "vhdl/linux_fb.vhdl"
+set file_obj [get_files -of_objects [get_filesets sources_1] [list "*$file"]]
+set_property -name "file_type" -value "VHDL" -objects $file_obj
+
+set file "vhdl/rrb_list_expander.vhdl"
 set file_obj [get_files -of_objects [get_filesets sources_1] [list "*$file"]]
 set_property -name "file_type" -value "VHDL" -objects $file_obj
 

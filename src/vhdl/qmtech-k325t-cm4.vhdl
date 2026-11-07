@@ -185,6 +185,7 @@ architecture Behavioral of container is
   signal bt_clk_b        : std_logic;
   signal video_sel       : std_logic_vector(7 downto 0);
   signal video_diag      : std_logic_vector(31 downto 0);
+  signal rk_pots         : std_logic_vector(31 downto 0);   -- paddles / 1351 mouse from the Rockchip
   signal video_diag2     : std_logic_vector(63 downto 0);
   signal lf_de, lf_hs, lf_vs : std_logic;
   signal lf_r, lf_g, lf_b    : unsigned(7 downto 0);
@@ -564,7 +565,7 @@ begin
       wbuf_we => emu_wbwe, wbuf_addr => emu_wba, wbuf_data => emu_wbd,
       mon_rx => mon_rx, mon_tx => uart_txd_int,
       matrix_col_idx => widget_idx, matrix_col => widget_col,
-      joya => rk_joya, joyb => rk_joyb, ctrl => rk_ctrl,
+      joya => rk_joya, joyb => rk_joyb, ctrl => rk_ctrl, pots => rk_pots,
       eth_tx_avail => eth_tx_avail, eth_tx_len => eth_tx_len, eth_tx_raddr => eth_tx_raddr,
       eth_tx_rdata => eth_tx_rdata, eth_tx_pop => eth_tx_pop, eth_tx_drops => eth_tx_drops,
       eth_rx_free => eth_rx_free, eth_rx_we => eth_rx_we, eth_rx_waddr => eth_rx_waddr,
@@ -710,6 +711,7 @@ begin
       fa_poty       => '0',
       fb_potx       => '0',
       fb_poty       => '0',
+      bridge_pots   => rk_pots,                    -- 1351 mouse / paddles via the Rockchip
 
       -- Internal SD card (bus #1) on J12.
       cs_bo  => sd_cs_int,

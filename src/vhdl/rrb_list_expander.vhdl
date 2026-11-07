@@ -74,6 +74,7 @@ architecture rtl of rrb_list_expander is
   signal full     : std_logic := '0';                          -- buffer limit reached
   signal prev_ff  : std_logic := '0';                          -- last even screen byte was $FF
   signal x_new    : unsigned(9 downto 0);
+  signal gx       : unsigned(9 downto 0) := (others => '0');   -- X of the GOTOX being written
   signal mask_ff  : std_logic;
 
   function any_obj(p : kinds_t) return boolean is
@@ -164,6 +165,8 @@ begin
         when Gotox0 =>
           bwe <= '1'; baddr <= opos;
           bscreen <= x_new(7 downto 0);
+          gx <= x_new;                            -- latched: last_x changes now, and a REL
+                                                  -- x_new would move with it in Gotox1
           -- colour byte 0: bit 7 transparent, bit 6 behind, bit 4 GOTOX, bit 3 ROWMASK enable
           bcolour <= ent(3)(6) & ent(3)(7) & "01" & (not mask_ff) & "000";
           last_x <= x_new;
@@ -172,7 +175,7 @@ begin
         when Gotox1 =>
           bwe <= '1'; baddr <= opos + 1;
           -- high byte: Y offset (15..13) and sign (12) as given, REL/reserved cleared, X 9..8
-          bscreen <= ent(1)(7 downto 4) & "00" & x_new(9 downto 8);
+          bscreen <= ent(1)(7 downto 4) & "00" & gx(9 downto 8);
           bcolour <= ent(2);                      -- draw mask
           flipx <= ent(3)(4); flipy <= ent(3)(5);
           oaddr <= ent(3)(3 downto 0) & ent(5) & ent(4);

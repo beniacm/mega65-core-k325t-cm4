@@ -200,6 +200,7 @@ entity viciv is
     colour_ram_cs : in std_logic;
     colour_ram_64k_en : in std_logic := '0';   -- XCTL bit 2 (K325T)
     fast_rrb_en : in std_logic := '0';        -- XCTL bit 4: paint 2 pixels per cycle (K325T)
+    rrb_list_en : in std_logic := '0';        -- XCTL bit 5: RRB list mode (K325T, upstream #747)
     charrom_fastio_rdata : out std_logic_vector(7 downto 0);
     charrom_cs : in std_logic;
 
@@ -467,6 +468,8 @@ architecture Behavioral of viciv is
                            FetchScreenRamLine,
                            FetchScreenRamLine2,
                            FetchScreenRamNext,
+                           ListWait,           -- K325T RRB list mode: drain the row fetch
+                           ListRun,            -- K325T RRB list mode: expander running
                            FetchFirstCharacter,
                            FetchNextCharacter,
                            FetchCharHighByte,
@@ -1136,6 +1139,32 @@ architecture Behavioral of viciv is
   -- Indicates if the next 16 bit screen token will be a GOTO/GOSUB token
   signal next_token_is_goto : std_logic := '0';
 
+  -- K325T RRB list mode (docs/rrb_list_mode.md in the lab repo): a LIST token ($FFFC) in a
+  -- CHR16 row starts a list of 8-byte object entries; rrb_list_expander writes a GOTOX + the
+  -- object's tokens per entry into the row buffer, colour bytes into a colour row buffer.
+  signal rl_en_s        : std_logic_vector(1 downto 0) := "00";
+  signal list_found     : std_logic := '0';           -- LIST token seen in this row's fetch
+  signal list_lo_fc     : std_logic := '0';           -- last even row byte was $FC
+  signal list_pos       : unsigned(9 downto 0) := (others => '0');   -- buffer index of LIST
+  signal row_list       : std_logic := '0';           -- current character row is expanded
+  signal row_scr_base   : unsigned(19 downto 0) := (others => '0');
+  signal row_col_start  : unsigned(15 downto 0) := (others => '0');
+  signal list_line_end  : std_logic := '0';
+  signal list_wait      : integer range 0 to 7 := 0;
+  signal expanding      : std_logic := '0';
+  signal exp_start, exp_busy, exp_done, exp_mreq, exp_bwe : std_logic := '0';
+  signal exp_out_len, exp_baddr : unsigned(9 downto 0);
+  signal exp_maddr      : unsigned(19 downto 0);
+  signal exp_caddr      : unsigned(15 downto 0);
+  signal exp_bscreen, exp_bcolour : unsigned(7 downto 0);
+  signal exp_ent_addr   : unsigned(19 downto 0);
+  signal colour_addrb   : unsigned(15 downto 0);
+  signal colourramdata_ram : unsigned(7 downto 0);
+  type cbuf_t is array (0 to 1023) of unsigned(7 downto 0);
+  signal cbuf           : cbuf_t := (others => x"00");
+  signal cbuf_dout      : unsigned(7 downto 0) := x"00";
+  signal cbuf_sel       : std_logic := '0';
+
   signal reg_alpha_delay : unsigned(3 downto 0) := x"1";
 
   signal is_fetch_start : std_logic := '0';
@@ -1244,8 +1273,8 @@ begin
         addra => std_logic_vector(colour_ram_fastio_address),
         dina => fastio_wdata, douta => colour_ram_fastio_rdata,
         clkb => pixelclock,
-        addrb => std_logic_vector(colourramaddress),
-        unsigned(doutb) => colourramdata);
+        addrb => std_logic_vector(colour_addrb),
+        unsigned(doutb) => colourramdata_ram);
   end generate;
 
   colourram: if not colour_ram_64k generate
@@ -1263,11 +1292,43 @@ begin
         clkb => pixelclock,
         web => (others => '0'),
 --        web => '0',
-        addrb => std_logic_vector(colourramaddress(14 downto 0)),
+        addrb => std_logic_vector(colour_addrb(14 downto 0)),
         dinb => (others => '0'),
-        unsigned(doutb) => colourramdata
+        unsigned(doutb) => colourramdata_ram
         );
   end generate;
+
+  -- K325T RRB list mode: expander + colour row buffer
+  colour_addrb <= exp_caddr when expanding = '1' else colourramaddress;
+  colourramdata <= cbuf_dout when cbuf_sel = '1' else colourramdata_ram;
+  exp_ent_addr <= row_scr_base + list_pos + 2;
+
+  rrblist0 : entity work.rrb_list_expander
+    generic map (MLAT => 3, CLAT => 1, LIMIT => 1020)
+    port map (clk => pixelclock, start => exp_start, ent_addr => exp_ent_addr,
+              out_start => list_pos, busy => exp_busy, done => exp_done, out_len => exp_out_len,
+              mreq => exp_mreq, maddr => exp_maddr, mdata => final_ramdata,
+              caddr => exp_caddr, cdata => colourramdata_ram,
+              bwe => exp_bwe, baddr => exp_baddr, bscreen => exp_bscreen, bcolour => exp_bcolour);
+
+  -- colour row buffer: written by the expander, read like colour RAM (one cycle) at the row
+  -- index of the painter's colour RAM address; selected for the expanded part of a list row
+  process (pixelclock)
+    variable d : unsigned(15 downto 0);
+  begin
+    if rising_edge(pixelclock) then
+      if exp_bwe = '1' then
+        cbuf(to_integer(exp_baddr)) <= exp_bcolour;
+      end if;
+      d := colourramaddress - row_col_start;
+      cbuf_dout <= cbuf(to_integer(d(9 downto 0)));
+      if row_list = '1' and expanding = '0' and d(15 downto 10) = "000000" and d(9 downto 0) >= list_pos then
+        cbuf_sel <= '1';
+      else
+        cbuf_sel <= '0';
+      end if;
+    end if;
+  end process;
 
   -- Used for main pixel pipeline colour lookup
   paletteram0: entity work.ram32x1024
@@ -3581,6 +3642,7 @@ begin
           & " text_mode=" & std_logic'image(text_mode)
           & ", sixteenbit_charset=" & std_logic'image(sixteenbit_charset);
         colourramaddress <= colour_ram_base + first_card_of_row;
+        row_col_start <= colour_ram_base + first_card_of_row;          -- K325T list mode
         -- Work out the screen ram address.  We only need to re-fetch screen
         -- RAM if first_card_of_row is different to last time.
         prev_first_card_of_row <= first_card_of_row;
@@ -4194,6 +4256,22 @@ begin
       screen_ram_buffer_write <= final_ramaccess_is_screen_row_fetch;
       screen_ram_buffer_write_address <= final_ramaccess_screen_row_buffer_address;
       screen_ram_buffer_din <= final_ramdata;
+      -- K325T list mode
+      rl_en_s <= rl_en_s(0) & rrb_list_en;
+      exp_start <= '0';
+      if exp_bwe = '1' then
+        screen_ram_buffer_write <= '1';
+        screen_ram_buffer_write_address <= exp_baddr;
+        screen_ram_buffer_din <= exp_bscreen;
+      end if;
+      if final_ramaccess_is_screen_row_fetch = '1' and list_found = '0' then
+        if final_ramaccess_screen_row_buffer_address(0) = '0' then
+          if final_ramdata = x"FC" then list_lo_fc <= '1'; else list_lo_fc <= '0'; end if;
+        elsif list_lo_fc = '1' and final_ramdata = x"FF" then
+          list_found <= '1';
+          list_pos <= final_ramaccess_screen_row_buffer_address - 1;
+        end if;
+      end if;
       -- Collect last token for processing
       screen_line_last_token(15 downto 8) <= final_ramdata;
       screen_line_last_token(7 downto 0) <= screen_line_last_token(15 downto 8);
@@ -4258,6 +4336,9 @@ begin
               & " text_mode=" & std_logic'image(text_mode)
               & ", sixteenbit_charset=" & std_logic'image(sixteenbit_charset);
             colourramaddress <= to_unsigned(safe_to_integer(colour_ram_base) + safe_to_integer(first_card_of_row),16);
+            -- K325T list mode: a new row, no LIST token seen yet
+            list_found <= '0'; list_lo_fc <= '0'; row_list <= '0';
+            row_scr_base <= screen_row_current_address;
 
             -- Now ask for the first byte.  We indicate all details of this
             -- read so that it can be committed by the receiving side of the logic.
@@ -4344,7 +4425,12 @@ begin
           if (sixteenbit_charset='1' and end_of_row_16='1')
             or (sixteenbit_charset='0' and end_of_row='1') then
             -- All done, move to actual row fetch
-            raster_fetch_state <= FetchFirstCharacter;
+            if rl_en_s(1) = '1' and sixteenbit_charset = '1' then
+              raster_fetch_state <= ListWait;         -- K325T list mode
+              list_wait <= 5;
+            else
+              raster_fetch_state <= FetchFirstCharacter;
+            end if;
             next_ramaccess_is_screen_row_fetch <= '0';
             next_ramaccess_is_glyph_data_fetch <= '0';
             next_ramaccess_is_sprite_data_fetch <= '0';
@@ -4365,9 +4451,26 @@ begin
               next_screen_row_fetch_address <= next_screen_row_fetch_address + 1;
             end if;
           end if;
+        when ListWait =>
+          -- K325T list mode: let the last row bytes land in the buffer (LIST detection), then
+          -- expand the lists or go straight to painting
+          if list_wait /= 0 then
+            list_wait <= list_wait - 1;
+          elsif list_found = '1' then
+            exp_start <= '1'; expanding <= '1'; row_list <= '1';
+            raster_fetch_state <= ListRun;
+          else
+            raster_fetch_state <= FetchFirstCharacter;
+          end if;
+        when ListRun =>
+          if exp_done = '1' then
+            expanding <= '0';
+            raster_fetch_state <= FetchFirstCharacter;
+          end if;
         when FetchFirstCharacter =>
           -- Show what we are doing in debug display mode
           render_activity <= "010";
+          list_line_end <= '0';
 
           next_ramaccess_is_screen_row_fetch <= '0';
           next_ramaccess_is_glyph_data_fetch <= '0';
@@ -4572,11 +4675,16 @@ begin
           raster_fetch_state <= FetchBitmapData;
         when FetchTextCell =>
           if screen_ram_is_ff='1' and screen_ram_high_is_ff='1' then
+            if row_list = '1' and screen_ram_buffer_read_address > list_pos then
+              -- K325T list mode: end of the expanded row (the row advance stays LINESTEP)
+              list_line_end <= '1';
+            else
             -- 16-bit Character is $FFFF, which is end of line marker.
             -- So remember that this line is short, and don't add the virtual
             -- row width, and abort drawing this line.
             short_line <= '1';
             short_line_length <= safe_to_integer(screen_ram_buffer_read_address);
+            end if;
           end if;
 
           report "LEGACY: from screen_ram we get glyph_number = $" & to_hstring(to_unsigned(safe_to_integer(glyph_number),16)) severity note;
@@ -4925,7 +5033,7 @@ begin
           else
             end_of_row <= '0';
           end if;
-          if (end_of_row = '1') or (short_line='1') then
+          if (end_of_row = '1' and row_list = '0') or (short_line='1') or (list_line_end = '1') then
             raster_fetch_state <= EndOfChargen;
           else
             raster_fetch_state <= PaintDispatch;
@@ -5957,7 +6065,7 @@ begin
   -- value changes so that it can be driven into the block ram and sampled at the next clock cycle, thus providing the
   -- expected data on the next clock as well.
   process(raster_fetch_state,this_ramaccess_is_screen_row_fetch,glyph_data_address,sprite_pointer_address,sprite_data_address,
-          ramaddress,this_screen_row_fetch_address,glyph_full_colour)
+          ramaddress,this_screen_row_fetch_address,glyph_full_colour,exp_mreq,exp_maddr)
   begin
     next_ramaddress <= ramaddress;
 
@@ -5998,6 +6106,10 @@ begin
         next_ramaddress <= sprite_data_address;
       when others => null;
     end case;
+    -- K325T RRB list mode: the expander reads entries and object data (ListRun only)
+    if exp_mreq = '1' then
+      next_ramaddress <= exp_maddr;
+    end if;
   end process;
 
   process (pixelclock) is

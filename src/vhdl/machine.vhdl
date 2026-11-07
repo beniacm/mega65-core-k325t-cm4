@@ -229,6 +229,10 @@ entity machine is
          fb_poty : in std_logic;
          pot_drain : buffer std_logic := '1';
          pot_via_iec : buffer std_logic := '1';
+         -- K325T: paddle / 1351 mouse values from the Rockchip bridge (pot1 x, pot1 y, pot2 x,
+         -- pot2 y); a port whose two bytes are $FF $FF (nothing connected) keeps the values
+         -- measured from fa/fb_potx/y
+         bridge_pots : in std_logic_vector(31 downto 0) := (others => '1');
 
         fa_left_drain_n : out std_logic;
         fa_right_drain_n : out std_logic;
@@ -809,6 +813,7 @@ architecture Behavioral of machine is
   signal pota_y : unsigned(7 downto 0);
   signal potb_x : unsigned(7 downto 0);
   signal potb_y : unsigned(7 downto 0);
+  signal pota_x_m, pota_y_m, potb_x_m, potb_y_m : unsigned(7 downto 0);   -- measured (mouse_input)
 
   signal mouse_debug : unsigned(7 downto 0);
   signal amiga_mouse_enable_a : std_logic;
@@ -1376,6 +1381,7 @@ begin
     port map (
       colour_ram_64k_en => xctl(2),
       fast_rrb_en => xctl(4),
+      rrb_list_en => xctl(5),
       pixelclock      => pixelclock,
       cpuclock        => cpuclock,
       all_pause => all_pause,
@@ -1629,11 +1635,17 @@ begin
       fb_right_out => fb_right_mout,
 
       -- We output the four sampled pot values
-      pota_x => pota_x,
-      pota_y => pota_y,
-      potb_x => potb_x,
-      potb_y => potb_y
+      pota_x => pota_x_m,
+      pota_y => pota_y_m,
+      potb_x => potb_x_m,
+      potb_y => potb_y_m
       );
+
+  -- K325T: bridge POT values take over a port when the bridge reports something connected
+  pota_x <= unsigned(bridge_pots(31 downto 24)) when bridge_pots(31 downto 16) /= x"FFFF" else pota_x_m;
+  pota_y <= unsigned(bridge_pots(23 downto 16)) when bridge_pots(31 downto 16) /= x"FFFF" else pota_y_m;
+  potb_x <= unsigned(bridge_pots(15 downto 8))  when bridge_pots(15 downto 0)  /= x"FFFF" else potb_x_m;
+  potb_y <= unsigned(bridge_pots(7 downto 0))   when bridge_pots(15 downto 0)  /= x"FFFF" else potb_y_m;
 
   iomapper0: entity work.iomapper
     generic map ( target => target,

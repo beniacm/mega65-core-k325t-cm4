@@ -11,7 +11,9 @@
 -- $FFD71F0 XCTL: K325T extension control, cleared by every reset (a real MEGA65 again):
 --   bit 0 = 1 MB chip RAM for the CPU/DMA, bit 1 = raster DMA list on,
 --   bit 2 = 64 KB colour RAM (VIC-IV, via xctl_out), bit 4 = fast RRB (VIC-IV paints
---   2 pixels per cycle); bit 3 is unused here (24 extra sprites on branch k325t-extra-sprites)
+--   2 pixels per cycle), bit 5 = RRB list mode (LIST token $FFFC in CHR16 rows, see the lab
+--   repo's docs/rrb_list_mode.md); bit 3 is unused here (24 extra sprites on branch
+--   k325t-extra-sprites)
 -- $FFD71F4-$FFD71F7: raster DMA list address (28 bits, little endian)
 -- (gs4510 snoops these writes and acts on them; the copies here are for reading back)
 -- All other addresses of the $FFD71xx page read 0.  Until the first write it reads an
@@ -43,7 +45,7 @@ architecture rtl of soft_rtc is
   signal dow            : unsigned(7 downto 0) := x"00";
   signal tick_cnt       : integer range 0 to clock_frequency - 1 := 0;
   signal xctl           : unsigned(7 downto 0) := x"00";       -- $FFD71F0
-  constant XCTL_BITS    : unsigned(7 downto 0) := x"17";       -- implemented bits (bit 3: see branch k325t-extra-sprites)
+  constant XCTL_BITS    : unsigned(7 downto 0) := x"37";       -- implemented bits (bit 3: see branch k325t-extra-sprites)
   type rdl_t is array (0 to 3) of unsigned(7 downto 0);
   signal rdma_list      : rdl_t := (others => x"00");          -- $FFD71F4-7
 
