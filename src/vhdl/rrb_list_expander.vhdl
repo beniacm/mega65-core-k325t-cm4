@@ -26,6 +26,7 @@ entity rrb_list_expander is
   port (
     clk       : in  std_logic;
     start     : in  std_logic;                        -- one cycle
+    abort     : in  std_logic := '0';                 -- stop now (raster line restarted)
     ent_addr  : in  unsigned(19 downto 0);            -- chip RAM address of the first entry
     out_start : in  unsigned(9 downto 0);             -- row buffer index of the LIST token
     busy      : out std_logic;
@@ -139,6 +140,10 @@ begin
         end if;
       end if;
 
+      if abort = '1' then
+        state <= Idle;
+        pk <= (others => KNone);
+      else
       case state is
         when Idle =>
           if start = '1' then
@@ -215,6 +220,7 @@ begin
           done <= '1';
           state <= Idle;
       end case;
+      end if;
     end if;
   end process;
 end architecture;

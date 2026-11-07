@@ -1153,6 +1153,14 @@ architecture Behavioral of viciv is
   signal list_wait      : integer range 0 to 7 := 0;
   signal expanding      : std_logic := '0';
   signal exp_start, exp_busy, exp_done, exp_mreq, exp_bwe : std_logic := '0';
+  signal exp_abort      : std_logic := '0';
+  -- The visible end of a raster line is where the last glyph was painted
+  -- (raster_buffer_max_write_address follows the write position).  Objects of a list row must
+  -- not shorten the row: the end of the row's ordinary part is saved at the first GOTOX of the
+  -- expanded part, and the line ends at the larger of the two.
+  signal list_in_exp    : std_logic := '0';
+  signal list_save_armed : std_logic := '0';
+  signal list_saved_max : unsigned(9 downto 0) := (others => '0');
   signal exp_out_len, exp_baddr : unsigned(9 downto 0);
   signal exp_maddr      : unsigned(19 downto 0);
   signal exp_caddr      : unsigned(15 downto 0);
@@ -1305,7 +1313,7 @@ begin
 
   rrblist0 : entity work.rrb_list_expander
     generic map (MLAT => 3, CLAT => 1, LIMIT => 1020)
-    port map (clk => pixelclock, start => exp_start, ent_addr => exp_ent_addr,
+    port map (clk => pixelclock, start => exp_start, abort => exp_abort, ent_addr => exp_ent_addr,
               out_start => list_pos, busy => exp_busy, done => exp_done, out_len => exp_out_len,
               mreq => exp_mreq, maddr => exp_maddr, mdata => final_ramdata,
               caddr => exp_caddr, cdata => colourramdata_ram,
@@ -3617,7 +3625,11 @@ begin
         -- Make sure we read and write to opposite halves of the raster buffer
         raster_buffer_write_address(10) <= raster_buffer_half_toggle xor no_raster_buffer_delay;
         raster_buffer_half_toggle <= not raster_buffer_half_toggle;
-        raster_buffer_max_write_address_hold <= raster_buffer_max_write_address;
+        if list_saved_max > raster_buffer_max_write_address then      -- K325T list mode
+          raster_buffer_max_write_address_hold <= list_saved_max;
+        else
+          raster_buffer_max_write_address_hold <= raster_buffer_max_write_address;
+        end if;
         report "setting raster_buffer_max_write_address_hold to $" & to_hstring(raster_buffer_max_write_address);
 
         -- Reset glyph Y offset each raster line
@@ -3642,7 +3654,6 @@ begin
           & " text_mode=" & std_logic'image(text_mode)
           & ", sixteenbit_charset=" & std_logic'image(sixteenbit_charset);
         colourramaddress <= colour_ram_base + first_card_of_row;
-        row_col_start <= colour_ram_base + first_card_of_row;          -- K325T list mode
         -- Work out the screen ram address.  We only need to re-fetch screen
         -- RAM if first_card_of_row is different to last time.
         prev_first_card_of_row <= first_card_of_row;
@@ -4259,6 +4270,10 @@ begin
       -- K325T list mode
       rl_en_s <= rl_en_s(0) & rrb_list_en;
       exp_start <= '0';
+      exp_abort <= '0';
+      if exp_done = '1' then
+        expanding <= '0';
+      end if;
       if exp_bwe = '1' then
         screen_ram_buffer_write <= '1';
         screen_ram_buffer_write_address <= exp_baddr;
@@ -4471,6 +4486,10 @@ begin
           -- Show what we are doing in debug display mode
           render_activity <= "010";
           list_line_end <= '0';
+          -- K325T list mode: the colour address painting starts from (whichever of the line
+          -- start / badline set it) is index 0 of the row
+          row_col_start <= colourramaddress;
+          list_in_exp <= '0'; list_save_armed <= row_list; list_saved_max <= (others => '0');
 
           next_ramaccess_is_screen_row_fetch <= '0';
           next_ramaccess_is_glyph_data_fetch <= '0';
@@ -4674,6 +4693,9 @@ begin
           report "LEGACY: from bitmap layout, we get glyph_data_address = $" & to_hstring("000"&glyph_data_address) severity note;
           raster_fetch_state <= FetchBitmapData;
         when FetchTextCell =>
+          if row_list = '1' and screen_ram_buffer_read_address > list_pos then
+            list_in_exp <= '1';                   -- this token is part of the expanded lists
+          end if;
           if screen_ram_is_ff='1' and screen_ram_high_is_ff='1' then
             if row_list = '1' and screen_ram_buffer_read_address > list_pos then
               -- K325T list mode: end of the expanded row (the row advance stays LINESTEP)
@@ -5067,6 +5089,12 @@ begin
               -- Set screen ram buffer write address to 10 bit
               -- offset indicated by glyph number bits
               raster_buffer_write_address(9 downto 0) <= glyph_number(9 downto 0) - 1;
+              -- K325T list mode: the first GOTOX of the expanded part -- everything before it is
+              -- painted (dispatch waits for paint_ready): remember where the ordinary row ends
+              if list_in_exp = '1' and list_save_armed = '1' then
+                list_saved_max <= raster_buffer_max_write_address;
+                list_save_armed <= '0';
+              end if;
 
               -- for GOTOX chars glyph_4bit is the ROWMASK enable bit
               if glyph_4bit='1' then
@@ -5465,6 +5493,11 @@ begin
       if raster_fetch_restart='1' and rrb_overtime_allowed='0' then        
         raster_fetch_state <= raster_fetch_state_init;
         raster_fetch_restart <= '0';
+        -- K325T list mode: an expansion still running at the next raster line is cut off;
+        -- the row is then painted as a plain row (never leave the colour port redirected)
+        if expanding = '1' then
+          exp_abort <= '1'; expanding <= '0'; row_list <= '0';
+        end if;
       end if;
       
       -- Push sprite data out in a drive cycle to improve timing closure.
