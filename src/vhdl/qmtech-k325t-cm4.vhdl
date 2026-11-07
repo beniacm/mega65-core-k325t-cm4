@@ -605,7 +605,10 @@ begin
     generic map(
       cpu_frequency   => 40500000,
       target          => qmtechk325t,
-      hyper_installed => false
+      hyper_installed => false,
+      chipram_size    => 1048576,      -- 1 MB (chipram_k325t.vhdl); 384 KB until $FFD71F0.0 = 1
+      chipram_1mb     => '1',
+      colour_ram_64k  => true          -- 64 KB colour RAM; 32 KB mirror until $FFD71F0.2 = 1
     )
     port map(
       pixelclock           => pixelclock,

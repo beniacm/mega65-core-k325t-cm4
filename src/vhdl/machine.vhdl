@@ -56,7 +56,12 @@ entity machine is
   generic (cpu_frequency : integer;
            hyper_installed : boolean := false;
            target : mega65_target_t;
-           num_eth_rx_buffers : integer := 4
+           num_eth_rx_buffers : integer := 4;
+           -- chip RAM (block RAM) size; real boards 384 KB.  Above 384 KB the CPU sees the
+           -- rest only after $FFD71F0 bit 0 is set (gs4510 chipram_compat_size)
+           chipram_size : integer := 393216;
+           chipram_1mb : std_logic := '0';
+           colour_ram_64k : boolean := false     -- K325T: 64 KB colour RAM behind XCTL bit 2
            );
   Port ( pixelclock : in STD_LOGIC;
          cpuclock : in std_logic;
@@ -706,6 +711,7 @@ architecture Behavioral of machine is
   signal pixel_blue : unsigned (7 downto 0);
   signal pixel_y : unsigned (11 downto 0);
   signal vicii_raster : unsigned (11 downto 0);
+  signal xctl : unsigned(7 downto 0);               -- K325T extension control ($FFD71F0)
   signal pixel_frame_toggle : std_logic;
   signal pixel_newframe : std_logic;
   signal pixel_newraster : std_logic;
@@ -1114,8 +1120,9 @@ begin
   end process;
 
   cpu0: entity work.gs4510
-    generic map(target => target)
+    generic map(target => target, chipram_size => chipram_size, chipram_1mb => chipram_1mb)
     port map(
+      raster_line => vicii_raster(8 downto 0),   -- K325T raster DMA list
       phi_1mhz => phi_1mhz,
       phi_2mhz => phi_2mhz,
       phi_3mhz => phi_3mhz,
@@ -1364,8 +1371,10 @@ begin
 
 
   viciv0: entity work.viciv
-    generic map ( hyper_installed => hyper_installed )
+    generic map ( hyper_installed => hyper_installed, chipram_size => chipram_size,
+                  colour_ram_64k => colour_ram_64k )
     port map (
+      colour_ram_64k_en => xctl(2),
       pixelclock      => pixelclock,
       cpuclock        => cpuclock,
       all_pause => all_pause,
@@ -1759,6 +1768,7 @@ begin
       data_i => fastio_wdata, data_o => fastio_rdata,
       hyppo_rdata => hyppo_rdata,
       hyppo_address => hyppo_address,
+      xctl_out => xctl,
       colourram_at_dc00 => colourram_at_dc00,
       drive_led0 => drive_led0,
       drive_led2 => drive_led2,

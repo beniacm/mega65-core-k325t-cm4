@@ -114,3 +114,10 @@ set_false_path -to   [get_ports {led[*]}]
 set_property BITSTREAM.CONFIG.CONFIGFALLBACK ENABLE [current_design]
 set_false_path -to   [get_ports {qspi_csn qspi_db[*]}]
 set_false_path -from [get_ports {qspi_db[*]}]
+
+## neoTRNG (gs4510 trng0): its ring oscillators are intended combinational loops (as in
+## mega65r2.xdc).  Without this, write_bitstream's DRC LUTLP-1 stops the build whenever
+## synthesis keeps them as LUT loops (first seen with the 1 MB chip RAM build).
+set trng_cells [get_cells -hier -regexp .*trng0.* -filter {NAME =~ .*/inv_chain_.* || NAME =~ .*/enable_sreg_.*}]
+set_property ALLOW_COMBINATORIAL_LOOPS true [get_nets -of_objects $trng_cells]
+set_disable_timing -to O [get_timing_arcs -of_objects $trng_cells]

@@ -118,6 +118,7 @@ set files [list \
  "[file normalize "$origin_dir/src/vhdl/ghdl_ram8x4096_sync_2cs.vhdl"]"\
  "[file normalize "$origin_dir/src/vhdl/ghdl_ram32x1024_sync.vhdl"]"\
  "[file normalize "$origin_dir/src/vhdl/colourram.vhdl"]"\
+ "[file normalize "$origin_dir/src/vhdl/colourram_k325t.vhdl"]"\
  "[file normalize "$origin_dir/src/vhdl/crc.vhdl"]"\
  "[file normalize "$origin_dir/src/vhdl/spdif_encoder.vhdl"]"\
  "[file normalize "$origin_dir/src/vhdl/sid_coeffs_mux.vhdl"]"\
@@ -133,7 +134,8 @@ set files [list \
  "[file normalize "$origin_dir/src/vhdl/buffereduart.vhdl"]"\
  "[file normalize "$origin_dir/src/vhdl/sid_6581.vhdl"]"\
  "[file normalize "$origin_dir/src/vhdl/multisid.vhdl"]"\
- "[file normalize "$origin_dir/src/vhdl/shadowram-no-attic.vhdl"]"\
+ "[file normalize "$origin_dir/src/vhdl/shadowram-k325t-lo.vhdl"]"\
+ "[file normalize "$origin_dir/src/vhdl/chipram_k325t.vhdl"]"\
  "[file normalize "$origin_dir/src/vhdl/sdcardio.vhdl"]"\
  "[file normalize "$origin_dir/src/vhdl/audio_mixer.vhdl"]"\
  "[file normalize "$origin_dir/src/vhdl/audio_complex.vhdl"]"\
@@ -549,7 +551,11 @@ set file "vhdl/sid_6581.vhdl"
 set file_obj [get_files -of_objects [get_filesets sources_1] [list "*$file"]]
 set_property -name "file_type" -value "VHDL" -objects $file_obj
 
-set file "vhdl/shadowram-no-attic.vhdl"
+set file "vhdl/shadowram-k325t-lo.vhdl"
+set file_obj [get_files -of_objects [get_filesets sources_1] [list "*$file"]]
+set_property -name "file_type" -value "VHDL" -objects $file_obj
+
+set file "vhdl/chipram_k325t.vhdl"
 set file_obj [get_files -of_objects [get_filesets sources_1] [list "*$file"]]
 set_property -name "file_type" -value "VHDL" -objects $file_obj
 
@@ -610,6 +616,10 @@ set file_obj [get_files -of_objects [get_filesets sources_1] [list "*$file"]]
 set_property -name "file_type" -value "VHDL" -objects $file_obj
 
 set file "vhdl/colourram.vhdl"
+set file_obj [get_files -of_objects [get_filesets sources_1] [list "*$file"]]
+set_property -name "file_type" -value "VHDL" -objects $file_obj
+
+set file "vhdl/colourram_k325t.vhdl"
 set file_obj [get_files -of_objects [get_filesets sources_1] [list "*$file"]]
 set_property -name "file_type" -value "VHDL" -objects $file_obj
 

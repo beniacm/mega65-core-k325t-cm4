@@ -8,6 +8,11 @@
 -- to the seconds restarts the sub-second counter, so a sync is exact to the clock tick.
 --   $FFD7110 seconds  $FFD7111 minutes  $FFD7112 hours (bit 7 = 24 h mode, always set)
 --   $FFD7113 day      $FFD7114 month    $FFD7115 year (20yy)  $FFD7116 day of week (0..6)
+-- $FFD71F0 XCTL: K325T extension control, cleared by every reset (a real MEGA65 again):
+--   bit 0 = 1 MB chip RAM for the CPU/DMA, bit 1 = raster DMA list on,
+--   bit 2 = 64 KB colour RAM (VIC-IV, via xctl_out)
+-- $FFD71F4-$FFD71F7: raster DMA list address (28 bits, little endian)
+-- (gs4510 snoops these writes and acts on them; the copies here are for reading back)
 -- All other addresses of the $FFD71xx page read 0.  Until the first write it reads an
 -- invalid date (day 0), which the ROM reports as "no RTC".
 --------------------------------------------------------------------------------
@@ -19,12 +24,14 @@ entity soft_rtc is
   generic ( clock_frequency : integer );
   port (
     clock        : in  std_logic;
+    reset_n      : in  std_logic := '1';   -- CPU reset: clears XCTL
     cs           : in  std_logic;
     fastio_addr  : in  unsigned(19 downto 0);
     fastio_write : in  std_logic;
     fastio_read  : in  std_logic;
     fastio_wdata : in  unsigned(7 downto 0);
-    fastio_rdata : out unsigned(7 downto 0)
+    fastio_rdata : out unsigned(7 downto 0);
+    xctl_out     : out unsigned(7 downto 0)
   );
 end entity;
 
@@ -34,6 +41,10 @@ architecture rtl of soft_rtc is
   signal year           : unsigned(7 downto 0) := x"00";       -- BCD, 20yy
   signal dow            : unsigned(7 downto 0) := x"00";
   signal tick_cnt       : integer range 0 to clock_frequency - 1 := 0;
+  signal xctl           : unsigned(7 downto 0) := x"00";       -- $FFD71F0
+  constant XCTL_BITS    : unsigned(7 downto 0) := x"07";       -- implemented bits
+  type rdl_t is array (0 to 3) of unsigned(7 downto 0);
+  signal rdma_list      : rdl_t := (others => x"00");          -- $FFD71F4-7
 
   -- BCD + 1 (no range check)
   function bcd_inc(v : unsigned(7 downto 0)) return unsigned is
@@ -63,9 +74,10 @@ architecture rtl of soft_rtc is
     end if;
   end function;
 begin
+  xctl_out <= xctl;
 
   -- reads: combinational onto the shared fastio bus, 'Z' when not selected
-  process (cs, fastio_read, fastio_addr, sec, min, hour, day, month, year, dow) is
+  process (cs, fastio_read, fastio_addr, sec, min, hour, day, month, year, dow, xctl, rdma_list) is
   begin
     if cs = '1' and fastio_read = '1' then
       case fastio_addr(7 downto 0) is
@@ -76,6 +88,11 @@ begin
         when x"14" => fastio_rdata <= month;
         when x"15" => fastio_rdata <= year;
         when x"16" => fastio_rdata <= dow;
+        when x"F0" => fastio_rdata <= xctl;
+        when x"F4" => fastio_rdata <= rdma_list(0);
+        when x"F5" => fastio_rdata <= rdma_list(1);
+        when x"F6" => fastio_rdata <= rdma_list(2);
+        when x"F7" => fastio_rdata <= rdma_list(3) and x"0F";
         when others => fastio_rdata <= x"00";
       end case;
     else
@@ -87,6 +104,14 @@ begin
     variable carry : boolean;
   begin
     if rising_edge(clock) then
+      if reset_n = '0' then
+        xctl <= x"00";
+      elsif cs = '1' and fastio_write = '1' and fastio_addr(7 downto 0) = x"F0" then
+        xctl <= fastio_wdata and XCTL_BITS;
+      end if;
+      if cs = '1' and fastio_write = '1' and fastio_addr(7 downto 2) = "111101" then
+        rdma_list(to_integer(fastio_addr(1 downto 0))) <= fastio_wdata;
+      end if;
       if cs = '1' and fastio_write = '1' then
         case fastio_addr(7 downto 0) is
           when x"10" => sec   <= fastio_wdata and x"7F"; tick_cnt <= 0;

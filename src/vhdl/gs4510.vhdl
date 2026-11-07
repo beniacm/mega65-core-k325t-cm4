@@ -42,6 +42,9 @@ entity gs4510 is
 
     cpufrequency : integer := 40;
     chipram_size : integer := 393216;
+    -- chip RAM the CPU sees after reset when chipram_size is larger (K325T: 384 KB, like a
+    -- real MEGA65, until $FFD71F0 bit 0 unlocks the rest)
+    chipram_compat_size : integer := 393216;
     target : mega65_target_t := mega65r2);
   port (
     mathclock : in std_logic;
@@ -53,6 +56,8 @@ entity gs4510 is
     cpu_slow : out std_logic := '0';
 
     reset : in std_logic;
+    -- VIC-II raster line ($D011.7/$D012), for the K325T raster DMA list
+    raster_line : in unsigned(8 downto 0) := (others => '0');
     reset_out : out std_logic;
     irq : in std_logic;
     nmi : in std_logic;
@@ -1006,6 +1011,24 @@ architecture Behavioural of gs4510 is
 
     );
   signal state : processor_state := ResetLow;
+  -- K325T extension control ($FFD71F0, cleared by reset): bit 0 = full chip RAM
+  signal xchip : std_logic := '0';
+  -- K325T raster DMA list: XCTL ($FFD71F0) bit 1 = enable, $FFD71F4-7 = list address.
+  -- Started every frame at raster line 0; a job with DMA options $D0 lo / $D1 hi suspends
+  -- the list (CPU runs on) until raster >= that line, then resumes at an instruction boundary.
+  signal rdma_enable      : std_logic := '0';
+  signal rdma_list        : unsigned(27 downto 0) := (others => '0');
+  signal rdma_due         : std_logic := '0';   -- start/resume at the next instruction boundary
+  signal rdma_active      : std_logic := '0';   -- a raster job chain is running
+  signal rdma_waiting     : std_logic := '0';   -- suspended until rdma_wait_line
+  signal rdma_wait_passed : std_logic := '0';   -- resumed job: do not wait again
+  signal rdma_wait_set    : std_logic := '0';   -- this job carries $D0/$D1
+  signal rdma_wait_line   : unsigned(8 downto 0) := (others => '0');   -- parsed from $D0/$D1
+  signal rdma_susp_line   : unsigned(8 downto 0) := (others => '0');   -- line a suspended job waits for
+  signal rdma_next        : unsigned(27 downto 0) := (others => '0');
+  signal rdma_saved_addr  : unsigned(27 downto 0) := (others => '0');
+  signal rdma_job_start   : unsigned(27 downto 0) := (others => '0');
+  signal raster_s1, raster_s2, raster_cur, raster_last : unsigned(8 downto 0) := (others => '0');
   signal fast_fetch_state : processor_state := InstructionDecode;
   signal normal_fetch_state : processor_state := InstructionFetch;
 
@@ -2219,7 +2242,7 @@ begin
         wait_states_non_zero <= '1';
         proceed <= '0';
         cpuport_num <= real_long_address(3 downto 0);
-      elsif long_address(27 downto 20)=x"00" and ((not long_address(19)) or chipram_1mb)='1' then
+      elsif long_address(27 downto 20)=x"00" and ((not long_address(19)) or (chipram_1mb and xchip))='1' then
         -- Reading from chipram
         -- @IO:C64 $0000002-$000FFFF - 64KB RAM
         -- @IO:C65 $0010000-$001FFFF - 64KB RAM
@@ -3253,6 +3276,18 @@ begin
         end if;
       end if;
 
+      -- K325T extension control register (read back through soft_rtc)
+      if target = qmtechk325t and real_long_address(27 downto 4) = x"FFD71F" then
+        case real_long_address(3 downto 0) is
+          when x"0" => xchip <= value(0); rdma_enable <= value(1);
+          when x"4" => rdma_list(7 downto 0) <= value;
+          when x"5" => rdma_list(15 downto 8) <= value;
+          when x"6" => rdma_list(23 downto 16) <= value;
+          when x"7" => rdma_list(27 downto 24) <= value(3 downto 0);
+          when others => null;
+        end case;
+      end if;
+
       -- And REU registers
       if real_long_address(15 downto 0) = x"ff00" then
         if reu_ff00_pending = '1' then
@@ -3635,7 +3670,7 @@ begin
       -- Get the shadow RAM address on the bus fast to improve timing.
       shadow_wdata <= value;
 
-      if long_address(27 downto 20)=x"00" and ((not long_address(19)) or chipram_1mb)='1' then
+      if long_address(27 downto 20)=x"00" and ((not long_address(19)) or (chipram_1mb and xchip))='1' then
         report "writing to chip RAM addr=$" & to_hstring(long_address) & " value = $" & to_hexstring(value) severity note;
         is_pending_dma_access <= '0';
         shadow_address <= shadow_address_next;
@@ -3840,6 +3875,22 @@ begin
       cache_flush_counter <= (others => '0');
 
     end c65_map_instruction;
+
+    -- K325T raster DMA: start (or resume) the raster list instead of the next instruction.
+    -- The CPU's own list address is saved and restored when the raster chain ends/suspends.
+    procedure rdma_start is
+    begin
+      rdma_due <= '0';
+      rdma_active <= '1';
+      rdma_saved_addr <= reg_dmagic_addr;
+      reg_dmagic_addr <= rdma_next;
+      job_uses_options <= '1';
+      job_is_f018b <= support_f018b;
+      dmagic_job_mapped_list <= '0';          -- 28-bit physical list address
+      dma_pending <= '1';
+      state <= DMAgicTrigger;
+      phi_add_backlog <= '1'; phi_new_backlog <= 1;
+    end procedure;
 
     procedure dmagic_reset_options is
     begin
@@ -5347,6 +5398,23 @@ begin
       -- report "monitor_instruction_strobe CLEARED";
 
       -- report "reset = " & std_logic'image(reset) severity note;
+      -- K325T raster DMA scheduling (raster_line comes from the pixel clock domain: use a
+      -- value only when two samples agree)
+      raster_s1 <= raster_line; raster_s2 <= raster_s1;
+      if raster_s1 = raster_s2 then
+        raster_cur <= raster_s2;
+      end if;
+      raster_last <= raster_cur;
+      if rdma_enable = '0' then
+        rdma_due <= '0'; rdma_waiting <= '0';
+      elsif raster_cur = 0 and raster_last /= 0 then
+        rdma_due <= '1'; rdma_next <= rdma_list;            -- new frame: list from the top
+        rdma_waiting <= '0'; rdma_wait_passed <= '0';
+      elsif rdma_waiting = '1' and raster_cur >= rdma_susp_line then
+        rdma_due <= '1'; rdma_next <= rdma_job_start;       -- resume the waiting job
+        rdma_waiting <= '0'; rdma_wait_passed <= '1';
+      end if;
+
       reset_drive <= reset;
       if reset_drive='0' or watchdog_reset='1' then
         reset_out <= '0';
@@ -5359,6 +5427,8 @@ begin
         report "resetting cpu: reset_drive = " & std_logic'image(reset_drive)
           & ", watchdog_reset=" & std_logic'image(watchdog_reset);
         reset_cpu_state;
+        xchip <= '0';                           -- extensions off: a real MEGA65 again
+        rdma_enable <= '0'; rdma_due <= '0'; rdma_active <= '0'; rdma_waiting <= '0';
       elsif phi_pause = '1' then
                                         -- Wait for time to catch up with CPU instructions when running at low
                                         -- speed (CPU actually runs at full speed, and just gets held here if it
@@ -5763,6 +5833,7 @@ begin
                                         -- Clear DMA pending flag
               report "DMAgic: Processing DMA request";
               dma_pending <= '0';
+              rdma_job_start <= reg_dmagic_addr;      -- K325T raster DMA: resume point
                                         -- Begin to load DMA registers
                                         -- We load them from the 20 bit address stored $D700 - $D702
                                         -- plus the 8-bit MB value in $D704
@@ -5837,6 +5908,10 @@ begin
                   when x"8c" => reg_dmagic_slope(15 downto 8) <= memory_read_value;
                   when x"8d" => reg_dmagic_slope_fraction_start(7 downto 0) <= memory_read_value;
                   when x"8e" => reg_dmagic_slope_fraction_start(15 downto 8) <= memory_read_value;
+                  -- @ IO:GS $D705 - K325T raster DMA job option $D0 $xx / $D1 $xx = wait until
+                  -- raster line >= $xx (bits 0-7) / bit 8 (only in the raster DMA list)
+                  when x"d0" => rdma_wait_line(7 downto 0) <= memory_read_value; rdma_wait_set <= '1';
+                  when x"d1" => rdma_wait_line(8) <= memory_read_value(0); rdma_wait_set <= '1';
                   when x"8f" => reg_dmagic_line_mode <= memory_read_value(7);
                                 reg_dmagic_line_x_or_y <= memory_read_value(6);
                                 reg_dmagic_line_slope_negative <= memory_read_value(5);
@@ -5880,7 +5955,21 @@ begin
                                         -- @ IO:GS $D705 - Enhanced DMAgic job option $00 = End of options
                     when x"00" =>
                       report "End of Enhanced DMA option list.";
-                      state <= DMAgicReadList;
+                      rdma_wait_set <= '0';
+                      rdma_wait_line <= (others => '0');
+                      if rdma_active = '1' and rdma_wait_set = '1' and rdma_wait_passed = '0'
+                         and raster_cur < rdma_wait_line then
+                        -- raster DMA: suspend until the line, give the CPU back
+                        rdma_waiting <= '1';
+                        rdma_susp_line <= rdma_wait_line;   -- (rdma_wait_line is cleared here)
+                        rdma_active <= '0';
+                        reg_dmagic_addr <= rdma_saved_addr;
+                        dmagic_reset_options;
+                        state <= normal_fetch_state;
+                      else
+                        rdma_wait_passed <= '0';
+                        state <= DMAgicReadList;
+                      end if;
                     -- @ IO:GS $D705 - Enhanced DMAgic job option $01 = Enable src/dst addresses crossing MB boundaries.
                     when x"01" => reg_dmagic_cross_mb_boundaries <= '1';
                     -- @ IO:GS $D705 - Enhanced DMAgic job option $06 = Use $86 $xx transparency value (don't write source bytes to destination, if byte value matches $xx)
@@ -6310,6 +6399,10 @@ begin
                   -- Reset DMAgic options to normal at the end of the last DMA job
                   -- in a chain.
                   dmagic_reset_options;
+                  if rdma_active = '1' then               -- K325T raster DMA chain done
+                    reg_dmagic_addr <= rdma_saved_addr;
+                    rdma_active <= '0';
+                  end if;
                   -- Continue after DMA job if it was an inline job
                   if dma_inline='1' then
                     reg_pc <= reg_dmagic_addr(15 downto 0);
@@ -6779,6 +6872,10 @@ begin
                                         -- Reset DMAgic options to normal at the end of the last DMA job
                                         -- in a chain.
                     dmagic_reset_options;
+                    if rdma_active = '1' then             -- K325T raster DMA chain done
+                      reg_dmagic_addr <= rdma_saved_addr;
+                      rdma_active <= '0';
+                    end if;
                     -- Continue after DMA job if it was an inline job
                     if dma_inline='1' then
                       reg_pc <= reg_dmagic_addr(15 downto 0);
@@ -6830,7 +6927,10 @@ begin
             when InstructionWait =>
               state <= InstructionFetch;
             when InstructionFetch =>
-              if (hypervisor_mode='0')
+              if hypervisor_mode = '0' and rdma_due = '1' and monitor_irq_inhibit = '0' then
+                pc_inc := '0';                        -- K325T raster DMA job first
+                rdma_start;
+              elsif (hypervisor_mode='0')
                 and ((irq_pending='1' and flag_i='0') or nmi_pending='1')
                 and (monitor_irq_inhibit='0') then
                                         -- An interrupt has occurred
@@ -6887,7 +6987,12 @@ begin
 
               -- 4502 doesn't allow interrupts immediately following a
               -- single-cycle instruction
-              if (hypervisor_mode='0') and (
+              if hypervisor_mode = '0' and no_interrupt = '0' and rdma_due = '1'
+                 and monitor_irq_inhibit = '0' then
+                reg_pc <= reg_pc - 1;                 -- K325T raster DMA job, then refetch
+                pc_inc := '0';
+                rdma_start;
+              elsif (hypervisor_mode='0') and (
                 (no_interrupt = '0')
                 and ((irq_pending='1' and flag_i='0') or nmi_pending='1')
                 and (monitor_irq_inhibit = '0')) then
@@ -7188,7 +7293,11 @@ begin
               reg_addressingmode <= mode_lut(to_integer(emu6502&memory_read_value));
               reg_instruction <= instruction_lut(to_integer(emu6502&memory_read_value));
 
-              if (hypervisor_mode='0')
+              if hypervisor_mode = '0' and rdma_due = '1' and monitor_irq_inhibit = '0' then
+                reg_pc <= reg_pc - 1;                 -- K325T raster DMA job, then refetch
+                pc_inc := '0';
+                rdma_start;
+              elsif (hypervisor_mode='0')
                 and ((irq_pending='1' and flag_i='0') or nmi_pending='1')
                 and (monitor_irq_inhibit = '0') then
                                         -- An interrupt has occurred
@@ -9142,7 +9251,7 @@ begin
   monitor_map_enables_high <= unsigned(reg_map_high);
 
   -- alternate (new) combinatorial core memory address generation.
-  process (state,reg_pc,vector,reg_t,hypervisor_mode,monitor_mem_attention_request_drive,monitor_mem_address_drive,
+  process (state,reg_pc,vector,reg_t,hypervisor_mode,monitor_mem_attention_request_drive,monitor_mem_address_drive,xchip,
            reg_dmagic_addr,mem_reading,flag_n,flag_v,flag_e,flag_d,flag_i,flag_z,flag_c,monitor_mem_write_drive,monitor_mem_wdata_drive,
            monitor_mem_read,monitor_mem_setpc,dmagic_src_addr,dmagic_dest_addr,viciii_iomode,reg_dmagic_transparent_value,
            reg_dmagic_use_transparent_value,reg_addressingmode,is_load,reg_pagenumber,reg_addr32save,reg_addr,reg_instruction,
@@ -10277,7 +10386,7 @@ begin
           -- (unfreezing requires it)
           shadow_write_var := (not rom_writeprotect) or hypervisor_mode;
           shadow_address_var := to_integer(long_address(19 downto 0));
-        elsif long_address(27 downto 20)=x"00" and ((not long_address(19)) or chipram_1mb)='1' then
+        elsif long_address(27 downto 20)=x"00" and ((not long_address(19)) or (chipram_1mb and xchip))='1' then
           report "writing to shadow RAM via chipram shadowing. addr=$" & to_hstring(long_address) severity note;
           if (long_address(19 downto 1)&'0'=x"00000") and (reg_map_low(0)='0') then
             shadow_write_var := '0';
@@ -10337,7 +10446,7 @@ begin
 
         long_address_read_var := long_address;
 
-        if long_address(27 downto 20)=x"00" and ((not long_address(19)) or chipram_1mb)='1' then
+        if long_address(27 downto 20)=x"00" and ((not long_address(19)) or (chipram_1mb and xchip))='1' then
           shadow_read_var := '1';
           is_pending_dma_access_lower := '0';
           shadow_address_var := to_integer(long_address(19 downto 0));
@@ -10368,7 +10477,8 @@ begin
 
       end if;
 
-      if shadow_address_var >= chipram_size then
+      if shadow_address_var >= chipram_size
+         or (xchip = '0' and shadow_address_var >= chipram_compat_size) then
         shadow_address_var := 0;
         shadow_write_var := '0';
       end if;

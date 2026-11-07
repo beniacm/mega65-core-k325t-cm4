@@ -55,6 +55,8 @@ use work.all;
 entity viciv is
   generic (
     chipram_size : integer := 393216;
+    -- K325T: 64 KB colour RAM ($FF80000-$FF8FFFF), 32 KB mirror until colour_ram_64k_en
+    colour_ram_64k : boolean := false;
     hyper_installed : boolean := false
     );
   Port (
@@ -196,6 +198,7 @@ entity viciv is
     fastio_rdata : out std_logic_vector(7 downto 0);
     colour_ram_fastio_rdata : out std_logic_vector(7 downto 0);
     colour_ram_cs : in std_logic;
+    colour_ram_64k_en : in std_logic := '0';   -- XCTL bit 2 (K325T)
     charrom_fastio_rdata : out std_logic_vector(7 downto 0);
     charrom_cs : in std_logic;
 
@@ -1115,8 +1118,19 @@ begin
       addrb  => std_logic_vector(screen_ram_buffer_read_address(9 downto 0))
       );
 
-  colourram: block
-  begin
+  colourram64: if colour_ram_64k generate
+    colourram1 : entity work.ram8x64k_k325t
+      port map (
+        en64 => colour_ram_64k_en,
+        clka => cpuclock, ena => colour_ram_cs, wea(0) => fastio_write,
+        addra => std_logic_vector(colour_ram_fastio_address),
+        dina => fastio_wdata, douta => colour_ram_fastio_rdata,
+        clkb => pixelclock,
+        addrb => std_logic_vector(colourramaddress),
+        unsigned(doutb) => colourramdata);
+  end generate;
+
+  colourram: if not colour_ram_64k generate
     colourram1 : entity work.ram8x32k
       PORT MAP (
         clka => cpuclock,
@@ -1135,7 +1149,7 @@ begin
         dinb => (others => '0'),
         unsigned(doutb) => colourramdata
         );
-  end block;
+  end generate;
 
   -- Used for main pixel pipeline colour lookup
   paletteram0: entity work.ram32x1024
