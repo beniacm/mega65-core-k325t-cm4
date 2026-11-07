@@ -199,6 +199,7 @@ entity viciv is
     colour_ram_fastio_rdata : out std_logic_vector(7 downto 0);
     colour_ram_cs : in std_logic;
     colour_ram_64k_en : in std_logic := '0';   -- XCTL bit 2 (K325T)
+    fast_rrb_en : in std_logic := '0';        -- XCTL bit 4: paint 2 pixels per cycle (K325T)
     charrom_fastio_rdata : out std_logic_vector(7 downto 0);
     charrom_cs : in std_logic;
 
@@ -974,6 +975,78 @@ architecture Behavioral of viciv is
   signal raster_buffer_write_address : unsigned(10 downto 0) := to_unsigned(0,10+1);
   signal raster_buffer_write_data : unsigned(17 downto 0) := to_unsigned(0,17+1);
   signal raster_buffer_write : std_logic := '0';
+  -- K325T fast RRB (XCTL bit 4): the raster buffer is split into even/odd pixel banks so that
+  -- the paint FSM can write two adjacent pixels per cycle.  rb_double = this cycle writes two:
+  -- pixel 1 (raster_buffer_write_data / _write) at raster_buffer_write_address - 1, pixel 2
+  -- (raster_buffer_write_data2 / _write2) at raster_buffer_write_address, which keeps its
+  -- meaning "address of the last pixel written" for everything else.
+  signal rb_fast_s : std_logic_vector(1 downto 0) := "00";
+  signal rb_double : std_logic := '0';
+  signal raster_buffer_write2 : std_logic := '0';
+  signal raster_buffer_write_data2 : unsigned(17 downto 0) := (others => '0');
+  signal rb_addr0, rb_addr1 : unsigned(10 downto 0) := (others => '0');
+  signal rb_din0, rb_din1 : unsigned(17 downto 0) := (others => '0');
+  signal rb_we0, rb_we1 : std_logic := '0';
+  signal rb_dout0, rb_dout1 : unsigned(17 downto 0) := (others => '0');
+  signal rb_rsel : std_logic := '0';
+  signal rb_raddr : unsigned(10 downto 0) := (others => '0');
+
+  -- one painted pixel as the raster buffer word (bit 17 alt palette, 16..9 alpha,
+  -- 8 foreground, 7..0 colour) -- exactly what the 1-pixel paint states write
+  function rb_fcm_px(b : unsigned(7 downto 0); with_alpha, force_fg, force_bg, transp_primary : std_logic;
+                     fg, bg : unsigned(7 downto 0); cur17 : std_logic) return unsigned is
+    variable r : unsigned(17 downto 0);
+  begin
+    r(17) := cur17;
+    if b = x"00" then
+      r(16 downto 9) := x"FF"; r(8) := force_fg; r(7 downto 0) := bg;
+      if transp_primary = '1' then r(17) := '0'; end if;
+    elsif with_alpha = '0' then
+      r(16 downto 9) := x"FF"; r(8) := not force_bg;
+      if b /= x"FF" then r(7 downto 0) := b; else r(7 downto 0) := fg; end if;
+    else
+      r(16 downto 9) := b; r(8) := (b(7) or force_fg) and (not force_bg); r(7 downto 0) := fg;
+    end if;
+    return r;
+  end function;
+  function rb_nib_px(n : unsigned(3 downto 0); with_alpha, force_fg, force_bg : std_logic;
+                     fg, bg : unsigned(7 downto 0); cur17 : std_logic) return unsigned is
+    variable r : unsigned(17 downto 0);
+  begin
+    r(17) := cur17;
+    if n = x"0" then
+      r(16 downto 9) := x"FF"; r(8) := force_fg; r(7 downto 0) := bg;
+    elsif with_alpha = '0' then
+      r(16 downto 9) := x"FF"; r(8) := not force_bg;
+      if n /= x"F" then r(7 downto 0) := fg(7 downto 4) & n; else r(7 downto 0) := fg; end if;
+    else
+      r(16 downto 13) := n; r(12 downto 9) := (others => n(0));
+      r(8) := (n(3) or force_fg) and (not force_bg); r(7 downto 0) := fg;
+    end if;
+    return r;
+  end function;
+  function rb_mono_px(bit : std_logic; force_fg, force_bg : std_logic;
+                      fg, bg : unsigned(7 downto 0); cur17 : std_logic) return unsigned is
+    variable r : unsigned(17 downto 0);
+  begin
+    r(17) := cur17; r(16 downto 9) := x"FF";
+    if bit = '1' then r(8) := not force_bg; r(7 downto 0) := fg;
+    else r(8) := not force_fg; r(7 downto 0) := bg; end if;
+    return r;
+  end function;
+  function rb_mc_px(bits : unsigned(1 downto 0); force_fg, force_bg : std_logic;
+                    fg, bg, mc1, mc2 : unsigned(7 downto 0); cur17 : std_logic) return unsigned is
+    variable r : unsigned(17 downto 0);
+  begin
+    r(17) := cur17; r(16 downto 9) := x"FF";
+    case bits is
+      when "00" => r(8) := not force_fg; r(7 downto 0) := bg;
+      when "01" => r(8) := not force_bg; r(7 downto 0) := mc1;
+      when "10" => r(8) := not force_bg; r(7 downto 0) := mc2;
+      when others => r(8) := not force_bg; r(7 downto 0) := fg;
+    end case;
+    return r;
+  end function;
 
   signal raster_buffer_max_write_address : unsigned(9 downto 0) := to_unsigned(0,9+1);
   signal raster_buffer_max_write_address_hold : unsigned(9 downto 0) := to_unsigned(0,9+1);
@@ -1096,16 +1169,61 @@ architecture Behavioral of viciv is
 
 begin
 
-  rasterbuffer1: entity work.ram18x2k
+  -- Raster buffer as even/odd pixel banks (K325T fast RRB; one write per bank per cycle).
+  -- Single writes (all of upstream's paint states): the bank of the address.  Double writes:
+  -- pixel 1 at address-1 and pixel 2 at address are always in different banks.
+  process (raster_buffer_write_address, raster_buffer_write, raster_buffer_write_data,
+           rb_double, raster_buffer_write2, raster_buffer_write_data2)
+    variable a1 : unsigned(10 downto 0);
+  begin
+    rb_addr0 <= resize(raster_buffer_write_address(10 downto 1), 11);
+    rb_addr1 <= resize(raster_buffer_write_address(10 downto 1), 11);
+    rb_din0 <= raster_buffer_write_data;
+    rb_din1 <= raster_buffer_write_data;
+    rb_we0 <= raster_buffer_write and not raster_buffer_write_address(0);
+    rb_we1 <= raster_buffer_write and raster_buffer_write_address(0);
+    if rb_double = '1' then
+      a1 := raster_buffer_write_address;
+      a1(9 downto 0) := raster_buffer_write_address(9 downto 0) - 1;
+      if raster_buffer_write_address(0) = '1' then
+        -- pixel 1 even (bank 0 @ a1/2), pixel 2 odd (bank 1 @ addr/2)
+        rb_addr0 <= resize(a1(10 downto 1), 11);
+        rb_din0 <= raster_buffer_write_data;  rb_we0 <= raster_buffer_write;
+        rb_din1 <= raster_buffer_write_data2; rb_we1 <= raster_buffer_write2;
+      else
+        -- pixel 1 odd (bank 1 @ a1/2), pixel 2 even (bank 0 @ addr/2)
+        rb_addr1 <= resize(a1(10 downto 1), 11);
+        rb_din1 <= raster_buffer_write_data;  rb_we1 <= raster_buffer_write;
+        rb_din0 <= raster_buffer_write_data2; rb_we0 <= raster_buffer_write2;
+      end if;
+    end if;
+  end process;
+
+  rasterbuffer_even: entity work.ram18x2k
     port map (
       clkl => pixelclock,
       clkr => pixelclock,
-      wel(0) => raster_buffer_write,
-      dinl => std_logic_vector(raster_buffer_write_data),
-      unsigned(doutr) => raster_buffer_read_data,
-      addrl => std_logic_vector(raster_buffer_write_address(10 downto 0)),
-      addrr => std_logic_vector(raster_buffer_read_address_next)
+      wel(0) => rb_we0,
+      dinl => std_logic_vector(rb_din0),
+      unsigned(doutr) => rb_dout0,
+      addrl => std_logic_vector(rb_addr0),
+      addrr => std_logic_vector(rb_raddr)
       );
+  rasterbuffer_odd: entity work.ram18x2k
+    port map (
+      clkl => pixelclock,
+      clkr => pixelclock,
+      wel(0) => rb_we1,
+      dinl => std_logic_vector(rb_din1),
+      unsigned(doutr) => rb_dout1,
+      addrl => std_logic_vector(rb_addr1),
+      addrr => std_logic_vector(rb_raddr)
+      );
+  process (pixelclock) begin
+    if rising_edge(pixelclock) then rb_rsel <= raster_buffer_read_address_next(0); end if;
+  end process;
+  raster_buffer_read_data <= rb_dout1 when rb_rsel = '1' else rb_dout0;
+  rb_raddr <= resize(raster_buffer_read_address_next(10 downto 1), 11);
 
   buffer1: entity work.screen_ram_buffer
     port map (
@@ -3027,6 +3145,7 @@ begin
     variable long_address : unsigned(31 downto 0) := (others => '0');
     variable next_glyph_number_temp : std_logic_vector(12 downto 0) := (others => '0');
     variable next_glyph_colour_temp : std_logic_vector(7 downto 0) := (others => '0');
+    variable rb_v1, rb_v2 : unsigned(17 downto 0);    -- K325T fast RRB pixels
   begin
     if rising_edge(pixelclock) and all_pause='0' then
 
@@ -5253,6 +5372,9 @@ begin
       -- Always write if we are using the primary or alternate palette
       raster_buffer_write_data(17) <= paint_alternate_palette xor glyph_alternate_palette_invert;
 
+      rb_fast_s <= rb_fast_s(0) & fast_rrb_en;   -- K325T fast RRB
+      rb_double <= '0';
+      raster_buffer_write2 <= '0';
       case paint_fsm_state is
         when Idle =>
           if paint_ready /= '1' then
@@ -5280,124 +5402,173 @@ begin
             paint_fsm_state <= PaintFullColourPixels;
           end if;
         when Paint4bitColourPixels =>
-          if paint_full_colour_data(3 downto 0) = x"0" then
-            -- background pixel
-            raster_buffer_write_data(16 downto 9) <= x"FF";  -- solid alpha
-            raster_buffer_write_data(8) <= force_chars_foreground;
-            raster_buffer_write_data(7 downto 0) <= paint_background_with_any_reverse;
+          if rb_fast_s(1) = '1' and paint_bits_remaining >= 1 and (raster_buffer_write_address(9 downto 0) <= 1020 or rrb_wraparound_allowed = '1') then
+            -- K325T fast RRB: two nybls per cycle
+            rb_v1 := rb_nib_px(paint_full_colour_data(3 downto 0), paint_with_alpha, force_chars_foreground,
+                               force_chars_background, paint_foreground, paint_background_with_any_reverse,
+                               raster_buffer_write_data(17));
+            rb_v2 := rb_nib_px(paint_full_colour_data(7 downto 4), paint_with_alpha, force_chars_foreground,
+                               force_chars_background, paint_foreground, paint_background_with_any_reverse, rb_v1(17));
+            raster_buffer_write_data <= rb_v1;
+            raster_buffer_write_data2 <= rb_v2;
+            if paint_full_colour_data(3 downto 0) /= x"0" or glyph_paint_background = '1' then
+              raster_buffer_write <= '1'; else raster_buffer_write <= '0'; end if;
+            if paint_full_colour_data(7 downto 4) /= x"0" or glyph_paint_background = '1' then
+              raster_buffer_write2 <= '1'; else raster_buffer_write2 <= '0'; end if;
+            paint_full_colour_data(55 downto 0) <= paint_full_colour_data(63 downto 8);
+            raster_buffer_write_address(9 downto 0) <= raster_buffer_write_address(9 downto 0) + 2;
+            raster_buffer_max_write_address <= raster_buffer_write_address(9 downto 0) + 2;
+            rb_double <= '1';
+            if paint_bits_remaining = 1 then
+              paint_fsm_state <= Idle;
+            else
+              paint_bits_remaining <= paint_bits_remaining - 2;
+            end if;
           else
-            -- foreground pixel
-            if paint_with_alpha='0' then
-              report "LEGACY: full-colour glyph painting pixel $" & to_hstring(paint_full_colour_data(7 downto 0))
-                & " into buffer @ $" & to_hstring(raster_buffer_write_address);
+            if paint_full_colour_data(3 downto 0) = x"0" then
+              -- background pixel
               raster_buffer_write_data(16 downto 9) <= x"FF";  -- solid alpha
-              --
-              raster_buffer_write_data(8) <= not force_chars_background;
+              raster_buffer_write_data(8) <= force_chars_foreground;
+              raster_buffer_write_data(7 downto 0) <= paint_background_with_any_reverse;
+            else
+              -- foreground pixel
+              if paint_with_alpha='0' then
+                report "LEGACY: full-colour glyph painting pixel $" & to_hstring(paint_full_colour_data(7 downto 0))
+                  & " into buffer @ $" & to_hstring(raster_buffer_write_address);
+                raster_buffer_write_data(16 downto 9) <= x"FF";  -- solid alpha
+                --
+                raster_buffer_write_data(8) <= not force_chars_background;
 
-              if paint_full_colour_data(3 downto 0) /= x"F" then
-                -- Lower four bits of colour come from the nybl
-                raster_buffer_write_data(3 downto 0) <= paint_full_colour_data(3 downto 0);
-                -- Upper four from the foreground colour from screen RAM.
-                -- This makes it much more useful for paralax layers etc
-                raster_buffer_write_data(7 downto 4) <= paint_foreground(7 downto 4);
+                if paint_full_colour_data(3 downto 0) /= x"F" then
+                  -- Lower four bits of colour come from the nybl
+                  raster_buffer_write_data(3 downto 0) <= paint_full_colour_data(3 downto 0);
+                  -- Upper four from the foreground colour from screen RAM.
+                  -- This makes it much more useful for paralax layers etc
+                  raster_buffer_write_data(7 downto 4) <= paint_foreground(7 downto 4);
+                else
+                  raster_buffer_write_data(7 downto 0) <= paint_foreground;
+                end if;
               else
+                -- XXX Add alternate alpha mode where alhpa value is picked by
+                -- colour RAM, allowing full colour chars to be faded in and out
+                -- from background?
+                report "LEGACY: full-colour glyph painting alpha pixel $"
+                  & to_hstring(paint_foreground)
+                  & " with alpha value $" & to_hstring(paint_full_colour_data(3 downto 0)) & "F"
+                  & " : raster_buffer_write_address=$" & to_hstring(raster_buffer_write_address)
+                  & " ( + 1 ?)";
+                -- 8-bit pixel values provide the alpha
+                raster_buffer_write_data(16 downto 13) <= paint_full_colour_data(3 downto 0);
+                raster_buffer_write_data(12 downto 9) <= (others => paint_full_colour_data(0));
+                raster_buffer_write_data(8) <= (paint_full_colour_data(3) or force_chars_foreground) and (not force_chars_background);
+                -- colour RAM colour provides the foreground
                 raster_buffer_write_data(7 downto 0) <= paint_foreground;
               end if;
-            else
-              -- XXX Add alternate alpha mode where alhpa value is picked by
-              -- colour RAM, allowing full colour chars to be faded in and out
-              -- from background?
-              report "LEGACY: full-colour glyph painting alpha pixel $"
-                & to_hstring(paint_foreground)
-                & " with alpha value $" & to_hstring(paint_full_colour_data(3 downto 0)) & "F"
-                & " : raster_buffer_write_address=$" & to_hstring(raster_buffer_write_address)
-                & " ( + 1 ?)";
-              -- 8-bit pixel values provide the alpha
-              raster_buffer_write_data(16 downto 13) <= paint_full_colour_data(3 downto 0);
-              raster_buffer_write_data(12 downto 9) <= (others => paint_full_colour_data(0));
-              raster_buffer_write_data(8) <= (paint_full_colour_data(3) or force_chars_foreground) and (not force_chars_background);
-              -- colour RAM colour provides the foreground
-              raster_buffer_write_data(7 downto 0) <= paint_foreground;
             end if;
-          end if;
-          paint_full_colour_data(59 downto 0) <= paint_full_colour_data(63 downto 4);
-          if (raster_buffer_write_address(9 downto 0) /= "1111111110") or rrb_wraparound_allowed='1' then
-            raster_buffer_write_address(9 downto 0) <= raster_buffer_write_address(9 downto 0) + 1;
-            raster_buffer_max_write_address <= raster_buffer_write_address(9 downto 0) + 1;
-          else
-            raster_buffer_max_write_address <= "1111111110";
-          end if;
-          if paint_full_colour_data(3 downto 0) /= x"0" or glyph_paint_background='1' then
-            raster_buffer_write <= '1';
-          else
-            raster_buffer_write <= '0';
-          end if;
-          report "LEGACY: full colour glyph paint_bits_remaining=" & integer'image(paint_bits_remaining) severity note;
-          if paint_bits_remaining > 0 then
-            paint_bits_remaining <= paint_bits_remaining - 1;
-          else
-            -- All done
-            paint_fsm_state <= Idle;
+            paint_full_colour_data(59 downto 0) <= paint_full_colour_data(63 downto 4);
+            if (raster_buffer_write_address(9 downto 0) /= "1111111110") or rrb_wraparound_allowed='1' then
+              raster_buffer_write_address(9 downto 0) <= raster_buffer_write_address(9 downto 0) + 1;
+              raster_buffer_max_write_address <= raster_buffer_write_address(9 downto 0) + 1;
+            else
+              raster_buffer_max_write_address <= "1111111110";
+            end if;
+            if paint_full_colour_data(3 downto 0) /= x"0" or glyph_paint_background='1' then
+              raster_buffer_write <= '1';
+            else
+              raster_buffer_write <= '0';
+            end if;
+            report "LEGACY: full colour glyph paint_bits_remaining=" & integer'image(paint_bits_remaining) severity note;
+            if paint_bits_remaining > 0 then
+              paint_bits_remaining <= paint_bits_remaining - 1;
+            else
+              -- All done
+              paint_fsm_state <= Idle;
+            end if;
           end if;
         when PaintFullColourPixels =>
-          if paint_full_colour_data(7 downto 0) = x"00" then
-            -- background pixel
-            raster_buffer_write_data(16 downto 9) <= x"FF";  -- solid alpha
-            raster_buffer_write_data(8) <= force_chars_foreground;
-            raster_buffer_write_data(7 downto 0) <= paint_background_with_any_reverse;
-            if transparent_pixel_will_come_from_primary_palette = '1' then
-              -- Overwrites default ALT palette selection logic
-              raster_buffer_write_data(17) <= '0';
-            end if;            
+          if rb_fast_s(1) = '1' and paint_bits_remaining >= 1 and (raster_buffer_write_address(9 downto 0) <= 1020 or rrb_wraparound_allowed = '1') then
+            -- K325T fast RRB: two bytes per cycle
+            rb_v1 := rb_fcm_px(paint_full_colour_data(7 downto 0), paint_with_alpha, force_chars_foreground,
+                               force_chars_background, transparent_pixel_will_come_from_primary_palette,
+                               paint_foreground, paint_background_with_any_reverse, raster_buffer_write_data(17));
+            rb_v2 := rb_fcm_px(paint_full_colour_data(15 downto 8), paint_with_alpha, force_chars_foreground,
+                               force_chars_background, transparent_pixel_will_come_from_primary_palette,
+                               paint_foreground, paint_background_with_any_reverse, rb_v1(17));
+            raster_buffer_write_data <= rb_v1;
+            raster_buffer_write_data2 <= rb_v2;
+            if paint_full_colour_data(7 downto 0) /= x"00" or glyph_paint_background = '1' then
+              raster_buffer_write <= '1'; else raster_buffer_write <= '0'; end if;
+            if paint_full_colour_data(15 downto 8) /= x"00" or glyph_paint_background = '1' then
+              raster_buffer_write2 <= '1'; else raster_buffer_write2 <= '0'; end if;
+            paint_full_colour_data(47 downto 0) <= paint_full_colour_data(63 downto 16);
+            raster_buffer_write_address(9 downto 0) <= raster_buffer_write_address(9 downto 0) + 2;
+            raster_buffer_max_write_address <= raster_buffer_write_address(9 downto 0) + 2;
+            rb_double <= '1';
+            if paint_bits_remaining = 1 then
+              paint_fsm_state <= Idle;
+            else
+              paint_bits_remaining <= paint_bits_remaining - 2;
+            end if;
           else
-            -- foreground pixel
-            if paint_with_alpha='0' then
-              report "LEGACY: full-colour glyph painting pixel $" & to_hstring(paint_full_colour_data(7 downto 0))
-                & " into buffer @ $" & to_hstring(raster_buffer_write_address);
+            if paint_full_colour_data(7 downto 0) = x"00" then
+              -- background pixel
               raster_buffer_write_data(16 downto 9) <= x"FF";  -- solid alpha
-              raster_buffer_write_data(8) <= not force_chars_background;
-              if paint_full_colour_data(7 downto 0) /= x"FF" then
-                raster_buffer_write_data(7 downto 0) <= paint_full_colour_data(7 downto 0);
+              raster_buffer_write_data(8) <= force_chars_foreground;
+              raster_buffer_write_data(7 downto 0) <= paint_background_with_any_reverse;
+              if transparent_pixel_will_come_from_primary_palette = '1' then
+                -- Overwrites default ALT palette selection logic
+                raster_buffer_write_data(17) <= '0';
+              end if;            
+            else
+              -- foreground pixel
+              if paint_with_alpha='0' then
+                report "LEGACY: full-colour glyph painting pixel $" & to_hstring(paint_full_colour_data(7 downto 0))
+                  & " into buffer @ $" & to_hstring(raster_buffer_write_address);
+                raster_buffer_write_data(16 downto 9) <= x"FF";  -- solid alpha
+                raster_buffer_write_data(8) <= not force_chars_background;
+                if paint_full_colour_data(7 downto 0) /= x"FF" then
+                  raster_buffer_write_data(7 downto 0) <= paint_full_colour_data(7 downto 0);
+                else
+                  raster_buffer_write_data(7 downto 0) <= paint_foreground;
+                end if;
               else
+                -- XXX Add alternate alpha mode where alhpa value is picked by
+                -- colour RAM, allowing full colour chars to be faded in and out
+                -- from background?
+                report "LEGACY: full-colour glyph painting alpha pixel $"
+                  & to_hstring(paint_foreground)
+                  & " with alpha value $" & to_hstring(paint_full_colour_data(7 downto 0))
+                  & " : raster_buffer_write_address=$" & to_hstring(raster_buffer_write_address)
+                  & " ( + 1 ?)";
+                -- 8-bit pixel values provide the alpha
+                raster_buffer_write_data(16 downto 9) <= paint_full_colour_data(7 downto 0);
+                raster_buffer_write_data(8) <= (paint_full_colour_data(7) or force_chars_foreground) and (not force_chars_background);
+                -- colour RAM colour provides the foreground
                 raster_buffer_write_data(7 downto 0) <= paint_foreground;
               end if;
-            else
-              -- XXX Add alternate alpha mode where alhpa value is picked by
-              -- colour RAM, allowing full colour chars to be faded in and out
-              -- from background?
-              report "LEGACY: full-colour glyph painting alpha pixel $"
-                & to_hstring(paint_foreground)
-                & " with alpha value $" & to_hstring(paint_full_colour_data(7 downto 0))
-                & " : raster_buffer_write_address=$" & to_hstring(raster_buffer_write_address)
-                & " ( + 1 ?)";
-              -- 8-bit pixel values provide the alpha
-              raster_buffer_write_data(16 downto 9) <= paint_full_colour_data(7 downto 0);
-              raster_buffer_write_data(8) <= (paint_full_colour_data(7) or force_chars_foreground) and (not force_chars_background);
-              -- colour RAM colour provides the foreground
-              raster_buffer_write_data(7 downto 0) <= paint_foreground;
             end if;
-          end if;
-          paint_full_colour_data(55 downto 0) <= paint_full_colour_data(63 downto 8);
-          if (raster_buffer_write_address(9 downto 0) /= "1111111110") or rrb_wraparound_allowed='1' then
-            raster_buffer_write_address(9 downto 0) <= raster_buffer_write_address(9 downto 0) + 1;
-            raster_buffer_max_write_address <= raster_buffer_write_address(9 downto 0) + 1;
-          else
-            raster_buffer_max_write_address <= "1111111110";
-          end if;
-          if glyph_paint_background='1' or paint_full_colour_data(7 downto 0) /= x"00" then
-            raster_buffer_write <= '1';
-          else
-            raster_buffer_write <= '0';
-          end if;
-          report "LEGACY: full colour glyph paint_bits_remaining=" & integer'image(paint_bits_remaining) severity note;
-          if paint_bits_remaining > 0 then
-            paint_bits_remaining <= paint_bits_remaining - 1;
-          else
-            paint_fsm_state <= PaintFullColourDone;
-          end if;
-          if paint_bits_remaining = 0 then
-            -- All done
-            paint_fsm_state <= Idle;
+            paint_full_colour_data(55 downto 0) <= paint_full_colour_data(63 downto 8);
+            if (raster_buffer_write_address(9 downto 0) /= "1111111110") or rrb_wraparound_allowed='1' then
+              raster_buffer_write_address(9 downto 0) <= raster_buffer_write_address(9 downto 0) + 1;
+              raster_buffer_max_write_address <= raster_buffer_write_address(9 downto 0) + 1;
+            else
+              raster_buffer_max_write_address <= "1111111110";
+            end if;
+            if glyph_paint_background='1' or paint_full_colour_data(7 downto 0) /= x"00" then
+              raster_buffer_write <= '1';
+            else
+              raster_buffer_write <= '0';
+            end if;
+            report "LEGACY: full colour glyph paint_bits_remaining=" & integer'image(paint_bits_remaining) severity note;
+            if paint_bits_remaining > 0 then
+              paint_bits_remaining <= paint_bits_remaining - 1;
+            else
+              paint_fsm_state <= PaintFullColourDone;
+            end if;
+            if paint_bits_remaining = 0 then
+              -- All done
+              paint_fsm_state <= Idle;
+            end if;
           end if;
         when PaintFullColourDone =>
           null;
@@ -5483,39 +5654,59 @@ begin
           report "LEGACY: clearing paint_ready";
           paint_fsm_state <= PaintMonoBits;
         when PaintMonoBits =>
-          if paint_bits_remaining = paint_glyph_width then
-            report "painting card using data $" & to_hstring(paint_buffer) severity note;
-          end if;
-          if paint_bits_remaining /= 0 then
-            report "LEGACY: Painting mono char pixel @ $" & to_hstring(raster_buffer_write_address)
-              & " (" & integer'image(paint_bits_remaining) & " pixels remaining in card.)";
-            paint_buffer<= '0'&paint_buffer(7 downto 1);
-            raster_buffer_write_data(16 downto 9) <= x"FF";  -- solid alpha
-            if paint_buffer(0)='1' then
-              raster_buffer_write_data(8) <= not force_chars_background;
-              raster_buffer_write_data(7 downto 0) <= paint_foreground;
-              report "Painting foreground pixel in colour $" & to_hstring(paint_foreground) severity note;
-            else
-              raster_buffer_write_data(8) <= not force_chars_foreground;
-              raster_buffer_write_data(7 downto 0) <= paint_background;
-              report "Painting background pixel in colour $" & to_hstring(paint_background) severity note;
+          if rb_fast_s(1) = '1' and paint_bits_remaining >= 2 and (raster_buffer_write_address(9 downto 0) <= 1020 or rrb_wraparound_allowed = '1') then
+            -- K325T fast RRB: two bits per cycle
+            rb_v1 := rb_mono_px(paint_buffer(0), force_chars_foreground, force_chars_background,
+                                paint_foreground, paint_background, raster_buffer_write_data(17));
+            rb_v2 := rb_mono_px(paint_buffer(1), force_chars_foreground, force_chars_background,
+                                paint_foreground, paint_background, raster_buffer_write_data(17));
+            raster_buffer_write_data <= rb_v1;
+            raster_buffer_write_data2 <= rb_v2;
+            raster_buffer_write <= paint_buffer(0) or glyph_paint_background;
+            raster_buffer_write2 <= paint_buffer(1) or glyph_paint_background;
+            paint_buffer <= "00" & paint_buffer(7 downto 2);
+            raster_buffer_write_address(9 downto 0) <= raster_buffer_write_address(9 downto 0) + 2;
+            raster_buffer_max_write_address <= raster_buffer_write_address(9 downto 0) + 2;
+            rb_double <= '1';
+            paint_bits_remaining <= paint_bits_remaining - 2;
+            if paint_bits_remaining = 2 then
+              paint_fsm_state <= Idle;
             end if;
-            if (raster_buffer_write_address(9 downto 0) /= "1111111110") or rrb_wraparound_allowed='1' then
-              raster_buffer_write_address(9 downto 0) <= raster_buffer_write_address(9 downto 0) + 1;
-              raster_buffer_max_write_address <= raster_buffer_write_address(9 downto 0) + 1;
-            else
-              raster_buffer_max_write_address <= "1111111110";
+          else
+            if paint_bits_remaining = paint_glyph_width then
+              report "painting card using data $" & to_hstring(paint_buffer) severity note;
             end if;
-            if paint_buffer(0)='1' or glyph_paint_background='1' then
-              raster_buffer_write <= '1';
-            else
-              raster_buffer_write <= '0';
+            if paint_bits_remaining /= 0 then
+              report "LEGACY: Painting mono char pixel @ $" & to_hstring(raster_buffer_write_address)
+                & " (" & integer'image(paint_bits_remaining) & " pixels remaining in card.)";
+              paint_buffer<= '0'&paint_buffer(7 downto 1);
+              raster_buffer_write_data(16 downto 9) <= x"FF";  -- solid alpha
+              if paint_buffer(0)='1' then
+                raster_buffer_write_data(8) <= not force_chars_background;
+                raster_buffer_write_data(7 downto 0) <= paint_foreground;
+                report "Painting foreground pixel in colour $" & to_hstring(paint_foreground) severity note;
+              else
+                raster_buffer_write_data(8) <= not force_chars_foreground;
+                raster_buffer_write_data(7 downto 0) <= paint_background;
+                report "Painting background pixel in colour $" & to_hstring(paint_background) severity note;
+              end if;
+              if (raster_buffer_write_address(9 downto 0) /= "1111111110") or rrb_wraparound_allowed='1' then
+                raster_buffer_write_address(9 downto 0) <= raster_buffer_write_address(9 downto 0) + 1;
+                raster_buffer_max_write_address <= raster_buffer_write_address(9 downto 0) + 1;
+              else
+                raster_buffer_max_write_address <= "1111111110";
+              end if;
+              if paint_buffer(0)='1' or glyph_paint_background='1' then
+                raster_buffer_write <= '1';
+              else
+                raster_buffer_write <= '0';
+              end if;
+              report "paint_bits_remaining=" & integer'image(paint_bits_remaining) severity note;
+              paint_bits_remaining <= paint_bits_remaining - 1;
             end if;
-            report "paint_bits_remaining=" & integer'image(paint_bits_remaining) severity note;
-            paint_bits_remaining <= paint_bits_remaining - 1;
-          end if;
-          if paint_bits_remaining = 1 or paint_bits_remaining = 0 then
-            paint_fsm_state <= Idle;
+            if paint_bits_remaining = 1 or paint_bits_remaining = 0 then
+              paint_fsm_state <= Idle;
+            end if;
           end if;
         when PaintMultiColour =>
           -- Drive stage costs us another cycle per glyph, but seems necessary
@@ -5599,48 +5790,70 @@ begin
           report "LEGACY: clearing paint_ready";
           paint_fsm_state <= PaintMultiColourBits;
         when PaintMultiColourBits =>
-          if paint_bits_remaining = (paint_glyph_width / 2) then
-            report "painting card using data $" & to_hstring(paint_buffer) severity note;
-          end if;
-          if paint_bits_remaining /= 0 then
-            paint_buffer<= "00"&paint_buffer(7 downto 2);
-            raster_buffer_write_data(16 downto 9) <= x"FF";  -- solid alpha
-            case paint_buffer(1 downto 0) is
-              when "00" =>
-                raster_buffer_write_data(8) <= not force_chars_foreground;
-                raster_buffer_write_data(7 downto 0) <= paint_background;
-                report "Painting background pixel in colour $" & to_hstring(paint_background) severity note;
-              when "01" =>
-                raster_buffer_write_data(8) <= not force_chars_background;
-                raster_buffer_write_data(7 downto 0) <= paint_mc1;
-                report "Painting multi-colour 2 pixel in colour $" & to_hstring(paint_mc1) severity note;
-              when "10" =>
-                raster_buffer_write_data(8) <= not force_chars_background;
-                raster_buffer_write_data(7 downto 0) <= paint_mc2;
-                report "Painting multi-colour 3 pixel in colour $" & to_hstring(paint_mc2) severity note;
-              when "11" =>
-                raster_buffer_write_data(8) <= not force_chars_background;
-                raster_buffer_write_data(7 downto 0) <= paint_foreground;
-                report "Painting foreground pixel in colour $" & to_hstring(paint_foreground) severity note;
-              when others =>
-                null;
-            end case;
-            if (raster_buffer_write_address(9 downto 0) /= "1111111110") or rrb_wraparound_allowed='1' then
-              raster_buffer_write_address(9 downto 0) <= raster_buffer_write_address(9 downto 0) + 1;
-              raster_buffer_max_write_address <= raster_buffer_write_address(9 downto 0) + 1;
+          if rb_fast_s(1) = '1' and paint_bits_remaining /= 0 and (raster_buffer_write_address(9 downto 0) <= 1020 or rrb_wraparound_allowed = '1') then
+            -- K325T fast RRB: one double-wide multicolour pixel per cycle (no Hold state)
+            rb_v1 := rb_mc_px(paint_buffer(1 downto 0), force_chars_foreground, force_chars_background,
+                              paint_foreground, paint_background, paint_mc1, paint_mc2,
+                              raster_buffer_write_data(17));
+            raster_buffer_write_data <= rb_v1;
+            raster_buffer_write_data2 <= rb_v1;
+            if paint_buffer(1 downto 0) /= "00" or glyph_paint_background = '1' then
+              raster_buffer_write <= '1'; raster_buffer_write2 <= '1';
             else
-              raster_buffer_max_write_address <= "1111111110";
+              raster_buffer_write <= '0'; raster_buffer_write2 <= '0';
             end if;
-            if paint_buffer(1 downto 0) /= "00" or glyph_paint_background='1' then
-              raster_buffer_write <= '1';
-            else
-              raster_buffer_write <= '0';
-            end if;
-            report "paint_bits_remaining=" & integer'image(paint_bits_remaining) severity note;
+            paint_buffer <= "00" & paint_buffer(7 downto 2);
+            raster_buffer_write_address(9 downto 0) <= raster_buffer_write_address(9 downto 0) + 2;
+            raster_buffer_max_write_address <= raster_buffer_write_address(9 downto 0) + 2;
+            rb_double <= '1';
             paint_bits_remaining <= paint_bits_remaining - 1;
+            if paint_bits_remaining = 1 then
+              paint_fsm_state <= Idle;
+            end if;
+          else
+            if paint_bits_remaining = (paint_glyph_width / 2) then
+              report "painting card using data $" & to_hstring(paint_buffer) severity note;
+            end if;
+            if paint_bits_remaining /= 0 then
+              paint_buffer<= "00"&paint_buffer(7 downto 2);
+              raster_buffer_write_data(16 downto 9) <= x"FF";  -- solid alpha
+              case paint_buffer(1 downto 0) is
+                when "00" =>
+                  raster_buffer_write_data(8) <= not force_chars_foreground;
+                  raster_buffer_write_data(7 downto 0) <= paint_background;
+                  report "Painting background pixel in colour $" & to_hstring(paint_background) severity note;
+                when "01" =>
+                  raster_buffer_write_data(8) <= not force_chars_background;
+                  raster_buffer_write_data(7 downto 0) <= paint_mc1;
+                  report "Painting multi-colour 2 pixel in colour $" & to_hstring(paint_mc1) severity note;
+                when "10" =>
+                  raster_buffer_write_data(8) <= not force_chars_background;
+                  raster_buffer_write_data(7 downto 0) <= paint_mc2;
+                  report "Painting multi-colour 3 pixel in colour $" & to_hstring(paint_mc2) severity note;
+                when "11" =>
+                  raster_buffer_write_data(8) <= not force_chars_background;
+                  raster_buffer_write_data(7 downto 0) <= paint_foreground;
+                  report "Painting foreground pixel in colour $" & to_hstring(paint_foreground) severity note;
+                when others =>
+                  null;
+              end case;
+              if (raster_buffer_write_address(9 downto 0) /= "1111111110") or rrb_wraparound_allowed='1' then
+                raster_buffer_write_address(9 downto 0) <= raster_buffer_write_address(9 downto 0) + 1;
+                raster_buffer_max_write_address <= raster_buffer_write_address(9 downto 0) + 1;
+              else
+                raster_buffer_max_write_address <= "1111111110";
+              end if;
+              if paint_buffer(1 downto 0) /= "00" or glyph_paint_background='1' then
+                raster_buffer_write <= '1';
+              else
+                raster_buffer_write <= '0';
+              end if;
+              report "paint_bits_remaining=" & integer'image(paint_bits_remaining) severity note;
+              paint_bits_remaining <= paint_bits_remaining - 1;
+            end if;
+            -- Stretch multi-colour pixels to be double width
+            paint_fsm_state <= PaintMultiColourHold;
           end if;
-          -- Stretch multi-colour pixels to be double width
-          paint_fsm_state <= PaintMultiColourHold;
         when PaintMultiColourHold =>
           if (raster_buffer_write_address(9 downto 0) /= "1111111110") or rrb_wraparound_allowed='1' then
             raster_buffer_write_address(9 downto 0) <= raster_buffer_write_address(9 downto 0) + 1;

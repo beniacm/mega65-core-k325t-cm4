@@ -1375,6 +1375,7 @@ begin
                   colour_ram_64k => colour_ram_64k )
     port map (
       colour_ram_64k_en => xctl(2),
+      fast_rrb_en => xctl(4),
       pixelclock      => pixelclock,
       cpuclock        => cpuclock,
       all_pause => all_pause,
