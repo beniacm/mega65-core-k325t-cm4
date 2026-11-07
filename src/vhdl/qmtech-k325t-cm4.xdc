@@ -62,7 +62,12 @@ set_property -dict {PACKAGE_PIN E26 IOSTANDARD LVCMOS33}             [get_ports 
 set_property -dict {PACKAGE_PIN A8  IOSTANDARD LVCMOS33 PULLDOWN TRUE} [get_ports rk_sck]
 set_property -dict {PACKAGE_PIN A9  IOSTANDARD LVCMOS33 PULLDOWN TRUE} [get_ports rk_mosi]
 set_property -dict {PACKAGE_PIN B15 IOSTANDARD LVCMOS33 PULLUP TRUE}   [get_ports rk_cs_n]
-set_property -dict {PACKAGE_PIN B9  IOSTANDARD LVCMOS33 DRIVE 8}       [get_ports rk_miso]
+set_property -dict {PACKAGE_PIN B9  IOSTANDARD LVCMOS33 DRIVE 8 SLEW FAST} [get_ports rk_miso]
+## The bridge oversamples SCK at 162 MHz and switches MISO 2-3 clocks after a rising SCK edge;
+## the master samples it one SCK period later (25 ns at 40 MHz).  The first sampling flip-flops
+## and the MISO register sit in the I/O cells, so pad delays are fixed and short whatever the
+## placement of the rest (a build with MISO placed far from B9 lost the link above 25 MHz).
+set_property IOB TRUE [get_ports {rk_sck rk_mosi rk_cs_n rk_miso}]
 ##   Nothing else on the CM4 bus is used: pads such as GPIO3_A7/C2/C3 come up
 ##   muxed to BT1120 video OUTPUT from the Rockchip boot DTB.
 

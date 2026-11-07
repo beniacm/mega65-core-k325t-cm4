@@ -1366,6 +1366,24 @@ begin
     );
   end generate;
 
+  ----------------------------------------------------------------------------------
+  -- QMTech K325T (no RTC chip): battery-less RTC registers, set by the Rockchip (m65d)
+  ----------------------------------------------------------------------------------
+  rtc_qmtech:
+  if target = qmtechk325t generate
+    rtc0: entity work.soft_rtc
+      generic map ( clock_frequency => cpu_frequency )
+      port map (
+        clock => cpuclock,
+        cs => i2cperipherals_cs,
+        fastio_addr => unsigned(address),
+        fastio_write => w,
+        fastio_read => r,
+        fastio_wdata => unsigned(data_i),
+        std_logic_vector(fastio_rdata) => data_o
+    );
+  end generate;
+
   -- XXX I2C bus of the MEGAphone R4 is currently disabled, as it is tied to
   -- the OrangeCrab as well.  We need to separate these two.
   i2cperiph_megaphone:
@@ -2152,6 +2170,13 @@ begin
         if address(19 downto 8) = x"D71" then
           i2cperipherals_cs <= '1';
           report "i2cperipherals_cs for MEGA65R2 asserted";
+        end if;
+      end if;
+
+      if target = qmtechk325t then
+        -- @IO:GS $FFD7110-$FFD7116 RTC (soft_rtc on the QMTech K325T: set by the Rockchip)
+        if address(19 downto 8) = x"D71" then
+          i2cperipherals_cs <= '1';
         end if;
       end if;
 
