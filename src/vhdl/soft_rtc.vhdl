@@ -46,6 +46,11 @@
 --   20 ycounter at the last copy end         21 ycounter at the last abort
 --   22 line start in ListWait while copying, in the border-line branch (its FetchFirstCharacter
 --      wins over the line start; also counted in 5)
+--   23 late pixels: raster buffer writes at or left of the pixel the display reads in that
+--      half, inside the text area (must stay 0)   24 ycounter at the last late pixel
+--   25 max cycles line start -> end of the line's painting (EndOfChargen; a painting cut off
+--      by the next line start counts the cycles it had)
+--   26 max cycles line start -> first GOTOX of a list row's expanded part (its first object)
 -- All other addresses of the $FFD71xx page read 0.  Until the first write it reads an
 -- invalid date (day 0), which the ROM reports as "no RTC".
 --------------------------------------------------------------------------------

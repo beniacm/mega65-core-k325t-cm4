@@ -1191,6 +1191,24 @@ architecture Behavioral of viciv is
   signal row_end_pos    : unsigned(10 downto 0) := (others => '0');  -- saturates at 1024
   signal exp_mfree      : std_logic;
   constant RRB_LIST_LIMIT : integer := 1020;          -- row buffer limit of the expansion
+  -- List mode lead (docs/rrb_list_mode.md, "First raster line budget"): with XCTL bit 5 or 6 on
+  -- (and $D051 NORRDEL = 1, DBLRR = 0, the defaults) every raster line is painted one line
+  -- earlier and shown one line later, so the picture stays where it is and every pixel the
+  -- line's painting writes before the next line start is in time (a badline's fetch +
+  -- expansion included).  Three parts, all inactive with rl_shift = '0':
+  --   * the fetch side's vertical position (pixels_since_last_char, before_ / justbefore_
+  --     y_chargen_start) uses displayy + 1 (displayy_p1): the whole row schedule (chargen_y,
+  --     badlines, first_card_of_row, the forced badlines above the text, the stop at the end)
+  --     runs one line ahead;
+  --   * the raster buffer is double buffered as with NORRDEL = 0: the painting that starts in
+  --     line N is shown in line N + 2;
+  --   * the display side's text-area mask (chargen_active forced off above / below the text)
+  --     is the fetch side's mask of the line before (rl_mask: captured at the line start,
+  --     taken over at x = 0), i.e. the original mask of that line.
+  -- Latched at the top of each frame (switching never happens inside a frame).
+  signal rl_shift       : std_logic := '0';
+  signal displayy_p1    : unsigned(11 downto 0) := to_unsigned(1,12);   -- always displayy + 1
+  signal rl_mask_next, rl_mask : std_logic := '1';
   -- list mode diagnostic counters (indices: soft_rtc.vhdl header, docs/rrb_list_mode.md)
   constant DG_FRAMES     : integer := 0;   -- exp_copy_start pulses
   constant DG_COPY_DONE  : integer := 1;   -- falling edges of exp_copying
@@ -1215,6 +1233,10 @@ architecture Behavioral of viciv is
   constant DG_COPY_Y     : integer := 20;  -- ycounter at the last copy end
   constant DG_ABORT_Y    : integer := 21;  -- ycounter at the last abort
   constant DG_WAIT_BORDER : integer := 22; -- line start in ListWait, copying, border-line branch
+  constant DG_LATE       : integer := 23;  -- raster buffer write behind the display (late pixel)
+  constant DG_LATE_Y     : integer := 24;  -- ycounter at the last late write
+  constant DG_PAINT_MAX  : integer := 25;  -- max cycles line start -> EndOfChargen (RRB time used)
+  constant DG_OBJ_MAX    : integer := 26;  -- max cycles line start -> first GOTOX of the expanded part
   type diag_cnt_t is array (0 to 31) of unsigned(15 downto 0);
   signal dg_cnt         : diag_cnt_t := (others => (others => '0'));
   signal dg_ev          : std_logic_vector(31 downto 0) := (others => '0');   -- events, registered
@@ -1225,6 +1247,8 @@ architecture Behavioral of viciv is
   signal dg_exp_t, dg_cp_t : unsigned(15 downto 0) := (others => '0');
   signal dg_ycounter    : unsigned(11 downto 0) := (others => '0');
   signal exp_ovf, exp_part, exp_cstall : std_logic;
+  signal dg_line_t      : unsigned(15 downto 0) := (others => '0');   -- cycles since the line start
+  signal dg_paint_run, dg_obj_pend : std_logic := '0';
 
   signal reg_alpha_delay : unsigned(3 downto 0) := x"1";
 
@@ -1384,6 +1408,7 @@ begin
   process (pixelclock)
     variable fs, rd : boolean;
     variable ev : std_logic_vector(31 downto 0);
+    variable lo : unsigned(9 downto 0);
   begin
     if rising_edge(pixelclock) then
       -- stage 1: events of this cycle
@@ -1435,6 +1460,17 @@ begin
       end if;
       if fs and raster_fetch_state = ListRun and exp_done = '1' then ev(DG_RUN_RACE) := '1'; end if;
       ev(DG_START_CP) := exp_start and exp_copying;
+      -- late pixel: a raster buffer write into the half the display reads now, at or left of
+      -- the pixel it reads, inside the text area and before this line's fetch start (after it
+      -- the writes belong to the next painting): that pixel comes too late for this line.
+      -- (RAM write enable and address are these registered signals in this very cycle.)
+      if (raster_buffer_write = '1' or raster_buffer_write2 = '1') and chargen_active = '1'
+         and xcounter < display_fetch_start
+         and raster_buffer_write_address(10) = raster_buffer_read_address(10) then
+        lo := raster_buffer_write_address(9 downto 0);
+        if rb_double = '1' then lo := lo - 1; end if;            -- pixel 1 of a double write
+        if lo <= raster_buffer_read_address(9 downto 0) then ev(DG_LATE) := '1'; end if;
+      end if;
       dg_ev <= ev;
       dg_copying_d <= exp_copying;
       dg_ycounter <= ycounter;
@@ -1462,10 +1498,30 @@ begin
           if dg_cp_t > dg_cnt(DG_COPY_MAX) then dg_cnt(DG_COPY_MAX) <= dg_cp_t; end if;
         end if;
       end if;
+      -- RRB time per line: line start -> EndOfChargen (a painting cut off by the next line
+      -- start counts with the cycles it had), and line start -> dispatch of the first GOTOX of
+      -- a list row's expanded part (its first object part)
+      if fs then
+        if dg_paint_run = '1' and dg_line_t > dg_cnt(DG_PAINT_MAX) then
+          dg_cnt(DG_PAINT_MAX) <= dg_line_t;
+        end if;
+        dg_line_t <= (others => '0'); dg_paint_run <= '1'; dg_obj_pend <= '1';
+      else
+        if dg_line_t /= x"FFFF" then dg_line_t <= dg_line_t + 1; end if;
+        if dg_paint_run = '1' and raster_fetch_state = EndOfChargen then
+          dg_paint_run <= '0';
+          if dg_line_t > dg_cnt(DG_PAINT_MAX) then dg_cnt(DG_PAINT_MAX) <= dg_line_t; end if;
+        end if;
+        if dg_obj_pend = '1' and raster_fetch_state = PaintDispatch and paint_ready = '1'
+           and glyph_goto = '1' and list_in_exp = '1' and list_save_armed = '1' then
+          dg_obj_pend <= '0';
+          if dg_line_t > dg_cnt(DG_OBJ_MAX) then dg_cnt(DG_OBJ_MAX) <= dg_line_t; end if;
+        end if;
+      end if;
 
       -- stage 2: counters
       for n in 0 to 31 loop
-        if (n <= DG_START_CP or n = DG_WAIT_BORDER) and n /= DG_EXP_MAX and n /= DG_COPY_MAX
+        if (n <= DG_START_CP or n = DG_WAIT_BORDER or n = DG_LATE) and n /= DG_EXP_MAX and n /= DG_COPY_MAX
            and n /= DG_FIRST_MAX and dg_ev(n) = '1' then
           if n = DG_PARTS or dg_cnt(n) /= x"FFFF" then
             dg_cnt(n) <= dg_cnt(n) + 1;
@@ -1474,6 +1530,7 @@ begin
       end loop;
       if dg_ev(DG_COPY_DONE) = '1' then dg_cnt(DG_COPY_Y) <= x"0" & dg_ycounter; end if;
       if dg_ev(DG_EXP_ABORT) = '1' then dg_cnt(DG_ABORT_Y) <= x"0" & dg_ycounter; end if;
+      if dg_ev(DG_LATE) = '1' then dg_cnt(DG_LATE_Y) <= x"0" & dg_ycounter; end if;
 
       dg_clr_s <= dg_clr_s(1 downto 0) & diag_clr;
       if dg_clr_s(2) /= dg_clr_s(1) then
@@ -3381,8 +3438,11 @@ begin
     variable next_glyph_number_temp : std_logic_vector(12 downto 0) := (others => '0');
     variable next_glyph_colour_temp : std_logic_vector(7 downto 0) := (others => '0');
     variable rb_v1, rb_v2 : unsigned(17 downto 0);    -- K325T fast RRB pixels
+    variable yf : unsigned(11 downto 0);              -- K325T list mode: fetch side's displayy
   begin
     if rising_edge(pixelclock) and all_pause='0' then
+      -- K325T list mode lead (rl_shift, see the signal): the row schedule runs one line ahead
+      if rl_shift = '1' then yf := displayy_p1; else yf := displayy; end if;
 
       report "ycounter = $" & to_hstring(ycounter) & ", ycounter_driver = $" & to_hstring(ycounter_driver);
       ycounter <= ycounter_driver;
@@ -3555,6 +3615,7 @@ begin
         -- (this has to happen on the following raster, because we determine
         -- end of screen when we pre-compute the next row address)
         if last_external_frame_x_zero_latched = '0' then
+          rl_mask <= rl_mask_next;                -- K325T list mode lead (see rl_shift)
           if stop_chargen_raster_counter /= 0 then
             stop_chargen_raster_counter <= stop_chargen_raster_counter - 1;
           end if;
@@ -3621,6 +3682,7 @@ begin
 
           displaycolumn0 <= '1';
           displayy <= displayy + 1;
+          displayy_p1 <= displayy_p1 + 1;               -- K325T list mode lead
           if displayy(4)='1' then
             displayline0 <= '0';
           end if;
@@ -3699,6 +3761,10 @@ begin
         first_card_of_row <= (others => '0');
 
         displayy <= (others => '0');
+        displayy_p1 <= to_unsigned(1,12);               -- K325T list mode lead
+        -- K325T list mode lead: on or off for the whole frame (NORRDEL = 0 already double
+        -- buffers; DBLRR fetches every other line only: both keep their own timing)
+        rl_shift <= (rl_en_s(1) or rv2_s(1)) and no_raster_buffer_delay and not raster_buffer_double_line;
         displayline0 <= '1';
         indisplay := '0';
         report "clearing indisplay because xcounter=0" severity note;
@@ -3753,17 +3819,18 @@ begin
 
       -- Work out where in the current character we seem to be
       -- (and allowing for smooth scrolling etc during drawing of the frame)
+      -- (K325T list mode lead: yf = displayy, or displayy + 1 with rl_shift)
       if reg_v400='1' then
-        if y_chargen_start > displayy then
+        if y_chargen_start > yf then
           pixels_since_last_char <= "000";
         else
-          pixels_since_last_char <= to_unsigned(safe_to_integer(displayy) - safe_to_integer(y_chargen_start),3) + 1;
+          pixels_since_last_char <= to_unsigned(safe_to_integer(yf) - safe_to_integer(y_chargen_start),3) + 1;
         end if;
       else
-        if y_chargen_start > displayy(11 downto 1) then
+        if y_chargen_start > yf(11 downto 1) then
           pixels_since_last_char <= "000";
         else
-          pixels_since_last_char <= to_unsigned(safe_to_integer(displayy(11 downto 1)) - safe_to_integer(y_chargen_start),3)
+          pixels_since_last_char <= to_unsigned(safe_to_integer(yf(11 downto 1)) - safe_to_integer(y_chargen_start),3)
                                     -- Magic fudge factor to get everything
                                     -- lining up correctly
                                     + to_unsigned(safe_to_integer(y_chargen_start(3 downto 1)) + 1,3);
@@ -3798,7 +3865,8 @@ begin
         -- Set write address to all 1's, so that it wraps to zero at the start
         raster_buffer_write_address(9 downto 0) <= (others => '1');
         -- Make sure we read and write to opposite halves of the raster buffer
-        raster_buffer_write_address(10) <= raster_buffer_half_toggle xor no_raster_buffer_delay;
+        -- (K325T list mode lead: double buffered as with NORRDEL = 0)
+        raster_buffer_write_address(10) <= raster_buffer_half_toggle xor (no_raster_buffer_delay and not rl_shift);
         raster_buffer_half_toggle <= not raster_buffer_half_toggle;
         if list_saved_max > raster_buffer_max_write_address then      -- K325T list mode
           raster_buffer_max_write_address_hold <= list_saved_max;
@@ -3806,6 +3874,9 @@ begin
           raster_buffer_max_write_address_hold <= raster_buffer_max_write_address;
         end if;
         report "setting raster_buffer_max_write_address_hold to $" & to_hstring(raster_buffer_max_write_address);
+
+        -- K325T list mode lead: this line's fetch side mask, shown in the next line
+        rl_mask_next <= before_y_chargen_start and not justbefore_y_chargen_start;
 
         -- Reset glyph Y offset each raster line
         glyph_y_offset <= 0;
@@ -4021,19 +4092,20 @@ begin
         chargen_active_soon <= '0';
       end if;
       y_chargen_start_minus_one <= y_chargen_start-1;
-      if displayy = (y_chargen_start_minus_one) then
+      -- (K325T list mode lead: yf, the fetch side's line; the frame top reset stays on displayy)
+      if yf = (y_chargen_start_minus_one) then
         justbefore_y_chargen_start <= '1';
       else
         justbefore_y_chargen_start <= '0';
       end if;
       if displayy = "000000000000" then
         before_y_chargen_start <= '1';
-      elsif displayy = y_chargen_start then
+      elsif yf = y_chargen_start then
         before_y_chargen_start <= '0';
       end if;
       -- Allow y_chargen_start to be shifted down mid-frame to allow
       -- multiple character displays per screen, e.g., for fixed vs scrolling.
-      if displayy < y_chargen_start_minus_one then
+      if yf < y_chargen_start_minus_one then
         before_y_chargen_start <= '1';
       end if;
       if before_y_chargen_start = '1' and justbefore_y_chargen_start='0' then
@@ -4052,13 +4124,21 @@ begin
         if chargen_y_sub /= 0 then
           report "LEGACY: Reseting chargen_y_sub";
         end if;
-        chargen_active <= '0';
-        chargen_active_soon <= '0';
+        if rl_shift = '0' then                    -- K325T list mode lead: rl_mask below
+          chargen_active <= '0';
+          chargen_active_soon <= '0';
+        end if;
         -- Force badline so that moving chargen down results in fresh loading
         -- of the first line of text.
         prev_first_card_of_row <= (others => '1');
         report "Masking chargen_active based on displayy<y_chargen_start" severity note;
 
+      end if;
+      -- K325T list mode lead: the text-area mask of the line shown now is the fetch side's mask
+      -- of the line before (which, one line ahead, is the original mask of this line)
+      if rl_shift = '1' and rl_mask = '1' then
+        chargen_active <= '0';
+        chargen_active_soon <= '0';
       end if;
 
       if xcounter(5)='1' and xcounter(4)='1' then
