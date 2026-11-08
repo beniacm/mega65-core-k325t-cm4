@@ -38,6 +38,9 @@
 --   +10 colour RAM offset of the tokens of object row 0
 --   +12 row stride: bytes from one object row's tokens to the next (screen and colour)
 --   +14 reserved
+-- Diagnostics only (the VIC-IV counters at $FFD71E0-3): ovf pulses when an expansion ends at
+-- the buffer limit (EntWait, ObjDrain, Scan, HitEmit), part is high in Gotox0 (one object
+-- part / v1 entry emitted), cstall while the copy has bytes left to issue and mfree = '0'.
 --------------------------------------------------------------------------------
 library ieee;
 use ieee.std_logic_1164.all;
@@ -74,7 +77,11 @@ entity rrb_list_expander is
     copy_start : in  std_logic := '0';               -- one cycle: snapshot the table
     tab_addr   : in  unsigned(19 downto 0) := (others => '0');
     mfree      : in  std_logic := '1';               -- chip RAM port free for the copy now
-    copying    : out std_logic
+    copying    : out std_logic;
+    -- diagnostics (VIC-IV counters at $FFD71E0-3; no effect on the expansion)
+    ovf        : out std_logic := '0';               -- one cycle: ended by the buffer limit
+    part       : out std_logic := '0';               -- an object part's GOTOX starts (Gotox0)
+    cstall     : out std_logic := '0'                -- copy has bytes to issue, port not free
   );
 end entity;
 
@@ -164,6 +171,8 @@ begin
   busy <= '0' when state = Idle else '1';
   -- (the VIC-IV starts no expansion then); tab_we: the last table word is written in this cycle
   copying <= cp_run or cp_pend or copy_start or tab_we;
+  part <= '1' when state = Gotox0 else '0';
+  cstall <= '1' when cp_run = '1' and cp_issue /= cp_n and mfree = '0' else '0';
 
   -- object table: LUT RAM (simple dual port, registered read)
   process (clk) begin
@@ -201,6 +210,7 @@ begin
       bwe <= '0';
       mreq <= '0';
       tab_we <= '0';
+      ovf <= '0';
 
       -- v2 table copy: returning bytes, assembled into 64-bit words (they arrive in order)
       for n in MLAT downto 2 loop
@@ -308,7 +318,7 @@ begin
           if ent_got = 8 then
             eaddr <= eaddr + 8;
             if opos > to_unsigned(LIMIT - 2, 10) then
-              state <= Finish0;
+              state <= Finish0; ovf <= '1';
             elsif ent(0) = x"FF" and ent(1) = x"FF" then
               if scan_after = '1' then
                 state <= ScanStart;               -- v2: the global objects follow the lists
@@ -356,7 +366,7 @@ begin
           -- wait until no object read is in flight
           if not any_obj(pk) then
             if full = '1' or ended = '0' then
-              state <= Finish0;                   -- buffer full (requests stopped at the limit)
+              state <= Finish0; ovf <= '1';       -- buffer full (requests stopped at the limit)
             elsif scanning = '1' then
               state <= HitEmit;                   -- v2: the other part, or on with the scan
             else
@@ -392,7 +402,7 @@ begin
             state <= Finish0;                     -- all objects seen
           end if;
           if opos > to_unsigned(LIMIT - 2, 10) then
-            state <= Finish0; spv <= "00";
+            state <= Finish0; spv <= "00"; ovf <= '1';
           elsif spv(2) = '1' then
             q := tab_q;
             if q(10) = '1' then ax := acc_x + q(9 downto 0); else ax := q(9 downto 0); end if;
@@ -462,7 +472,7 @@ begin
             -- buffer limit as in EntWait (a GOTOX + tokens no longer fit): end the row here,
             -- also instead of resuming the scan
             h_pa <= '0'; h_pb <= '0';
-            state <= Finish0;
+            state <= Finish0; ovf <= '1';
           elsif h_pa = '1' and ma /= x"00" then
             h_pa <= '0';
             ent(1) <= h_o & (not fy) & "00" & h_x(9 downto 8);

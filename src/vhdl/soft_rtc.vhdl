@@ -19,6 +19,33 @@
 -- $FFD71FB: number of objects (0..255, 16 bytes each)
 -- $FFD71FC: bit 0 = HOLD: the VIC-IV keeps its last snapshot of the table (no copy per frame)
 -- (gs4510 snoops these writes and acts on them; the copies here are for reading back)
+-- $FFD71E0-$FFD71E3: RRB list mode diagnostic counters (16-bit, in the VIC-IV, pixel clock):
+--   $FFD71E0 write: select counter 0..31, read: the selected index
+--   $FFD71E1 / $FFD71E2 read: low / high byte of the selected counter (synchronised copy; a
+--     torn 16-bit read is possible: read until two reads agree; allow ~4 CPU cycles after a
+--     select before reading)
+--   $FFD71E3 write (any value): clear all counters and maxima (a toggle to the VIC-IV); reads 0
+--   Counters saturate at $FFFF unless noted; unused indices read 0:
+--    0 frames (table copy starts)            1 copies finished (copying falls)
+--    2 expansions started                    3 expansions finished (done)
+--    4 expander aborts                       5 line start in ListWait while the copy runs
+--                                              (the kept first text row painted plainly)
+--    6 v2 rows painted plainly: append point beyond LIMIT - 2 (full-row guard)
+--    7 port collisions: expander read while the VIC-IV reads (must stay 0)
+--    8 expansions ended by the buffer limit  9 object parts emitted (Gotox0; wraps)
+--   10 max expansion duration (pixel cycles, start -> done; aborted ones not counted)
+--   11 max copy duration (copy start -> copying falls)
+--   12 copy stall cycles (bytes left to issue, port busy)
+--   13 expansions of $FFFF rows (row_short)  14 line start during an expansion (abort)
+--   15 expansions started with start_scan (v2, no LIST token)
+--   16 max cycles from copy start to the first copy read
+--   17 line start in ListWait (no copy running) in the edge where the ListWait arm decides:
+--      the arm's assignment wins over the line start
+--   18 line start in ListRun in the exp_done edge (ListRun's assignment wins)
+--   19 expansions started while copying (must stay 0)
+--   20 ycounter at the last copy end         21 ycounter at the last abort
+--   22 line start in ListWait while copying, in the border-line branch (its FetchFirstCharacter
+--      wins over the line start; also counted in 5)
 -- All other addresses of the $FFD71xx page read 0.  Until the first write it reads an
 -- invalid date (day 0), which the ROM reports as "no RTC".
 --------------------------------------------------------------------------------
@@ -38,7 +65,10 @@ entity soft_rtc is
     fastio_wdata : in  unsigned(7 downto 0);
     fastio_rdata : out unsigned(7 downto 0);
     xctl_out     : out unsigned(7 downto 0);
-    xobj_out     : out unsigned(28 downto 0)    -- list mode v2 (VIC-IV): hold & count & table
+    xobj_out     : out unsigned(28 downto 0);   -- list mode v2 (VIC-IV): hold & count & table
+    diag_sel_out : out unsigned(4 downto 0);    -- list mode diagnostic counters (VIC-IV)
+    diag_clr_out : out std_logic;               -- toggles on a write to $FFD71E3
+    diag_val_in  : in  unsigned(15 downto 0) := (others => '0')   -- pixel clock domain
   );
 end entity;
 
@@ -54,6 +84,9 @@ architecture rtl of soft_rtc is
   signal rdma_list      : rdl_t := (others => x"00");          -- $FFD71F4-7
   signal obj_tab        : rdl_t := (others => x"00");          -- $FFD71F8-B (B: count)
   signal obj_hold       : std_logic := '0';                    -- $FFD71FC bit 0
+  signal diag_sel       : unsigned(4 downto 0) := (others => '0');   -- $FFD71E0
+  signal diag_clr_t     : std_logic := '0';                    -- toggled by $FFD71E3 writes
+  signal diag_v1, diag_v2 : unsigned(15 downto 0) := (others => '0');   -- diag_val_in, synchronised
 
   -- BCD + 1 (no range check)
   function bcd_inc(v : unsigned(7 downto 0)) return unsigned is
@@ -85,9 +118,11 @@ architecture rtl of soft_rtc is
 begin
   xctl_out <= xctl;
   xobj_out <= obj_hold & obj_tab(3) & obj_tab(2)(3 downto 0) & obj_tab(1) & obj_tab(0);
+  diag_sel_out <= diag_sel;
+  diag_clr_out <= diag_clr_t;
 
   -- reads: combinational onto the shared fastio bus, 'Z' when not selected
-  process (cs, fastio_read, fastio_addr, sec, min, hour, day, month, year, dow, xctl, rdma_list, obj_tab, obj_hold) is
+  process (cs, fastio_read, fastio_addr, sec, min, hour, day, month, year, dow, xctl, rdma_list, obj_tab, obj_hold, diag_sel, diag_v2) is
   begin
     if cs = '1' and fastio_read = '1' then
       case fastio_addr(7 downto 0) is
@@ -98,6 +133,9 @@ begin
         when x"14" => fastio_rdata <= month;
         when x"15" => fastio_rdata <= year;
         when x"16" => fastio_rdata <= dow;
+        when x"E0" => fastio_rdata <= "000" & diag_sel;
+        when x"E1" => fastio_rdata <= diag_v2(7 downto 0);
+        when x"E2" => fastio_rdata <= diag_v2(15 downto 8);
         when x"F0" => fastio_rdata <= xctl;
         when x"F4" => fastio_rdata <= rdma_list(0);
         when x"F5" => fastio_rdata <= rdma_list(1);
@@ -128,6 +166,13 @@ begin
         obj_tab(to_integer(fastio_addr(1 downto 0))) <= fastio_wdata;
       elsif cs = '1' and fastio_write = '1' and fastio_addr(7 downto 0) = x"FC" then
         obj_hold <= fastio_wdata(0);
+      end if;
+      diag_v1 <= diag_val_in; diag_v2 <= diag_v1;
+      if cs = '1' and fastio_write = '1' and fastio_addr(7 downto 0) = x"E0" then
+        diag_sel <= fastio_wdata(4 downto 0);
+      end if;
+      if cs = '1' and fastio_write = '1' and fastio_addr(7 downto 0) = x"E3" then
+        diag_clr_t <= not diag_clr_t;
       end if;
       if cs = '1' and fastio_write = '1' and fastio_addr(7 downto 2) = "111101" then
         rdma_list(to_integer(fastio_addr(1 downto 0))) <= fastio_wdata;
