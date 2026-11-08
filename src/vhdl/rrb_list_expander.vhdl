@@ -112,6 +112,11 @@ architecture rtl of rrb_list_expander is
   type idx_t is array (1 to MLAT) of unsigned(9 downto 0);
   signal pk   : kinds_t := (others => KNone);
   signal pidx : idx_t := (others => (others => '0'));     -- entry byte number / buffer index
+  -- object generation of each in-flight read: a finished object's extra reads (issued until its
+  -- $FFFF came back) are ignored, so the next object starts without waiting for them
+  type gen_t is array (1 to MLAT) of std_logic;
+  signal pg   : gen_t := (others => '0');
+  signal og   : std_logic := '0';
   type cdel_t is array (1 to MLAT) of unsigned(7 downto 0);
   signal cdl  : cdel_t := (others => (others => '0'));    -- colour data, delayed
 
@@ -434,7 +439,7 @@ begin
 
       -- shift the request pipeline and the colour data
       for n in MLAT downto 2 loop
-        pk(n) <= pk(n - 1); pidx(n) <= pidx(n - 1); cdl(n) <= cdl(n - 1);
+        pk(n) <= pk(n - 1); pidx(n) <= pidx(n - 1); cdl(n) <= cdl(n - 1); pg(n) <= pg(n - 1);
       end loop;
       pk(1) <= KNone;
       cdl(1) <= cdata;
@@ -445,7 +450,7 @@ begin
       if k = KEnt then
         ent(to_integer(i(2 downto 0))) <= mdata;
         ent_got <= ent_got + 1;
-      elsif k = KObj and ended = '0' then
+      elsif k = KObj and ended = '0' and pg(MLAT) = og then
         c := cdl(MLAT - CLAT - 1);
         if i(0) = '0' then
           -- low byte of a token (colour byte 0: flip bits, GOTOX flag)
@@ -535,14 +540,24 @@ begin
           oreq_idx <= opos + 2;
           opos <= opos + 2;
           ended <= '0'; prev_ff <= '0';
+          og <= not og;                           -- a new object: older reads are stale
           state <= ObjRun;
 
         when ObjRun =>
-          if ended = '1' or oreq_idx > to_unsigned(LIMIT + 1, 10) then
+          if ended = '1' then
+            -- the object's $FFFF is back: its extra reads in flight are ignored (generation)
+            if full = '1' then
+              state <= Finish0; ovf <= '1';
+            elsif scanning = '1' then
+              state <= HitEmit;                   -- v2: the other part, or on with the scan
+            else
+              state <= EntReq; ent_req <= 0; ent_got <= 0;
+            end if;
+          elsif oreq_idx > to_unsigned(LIMIT + 1, 10) then
             state <= ObjDrain;
           else
             mreq <= '1'; maddr <= oaddr; caddr <= ocol;
-            pk(1) <= KObj; pidx(1) <= oreq_idx;
+            pk(1) <= KObj; pidx(1) <= oreq_idx; pg(1) <= og;
             oaddr <= oaddr + 1; ocol <= ocol + 1; oreq_idx <= oreq_idx + 1;
           end if;
 
@@ -618,7 +633,8 @@ begin
               if not pa then h_bsel <= "00"; elsif q(53) = '1' then h_bsel <= "10"; else h_bsel <= "01"; end if;
               s_issue <= ('0' & spi(2)) + 1;      -- resume after this object
               spv <= "00";
-              state <= HitB0;
+              tab_ra <= spi(2) & '1';           -- (HitB0's read, started in this cycle)
+              state <= HitB1;
             end if;
           end if;
 
@@ -673,6 +689,12 @@ begin
           else
             h_pa <= '0'; h_pb <= '0';
             state <= Scan;
+            -- the scan's next table read already now (it resumes one cycle earlier)
+            if s_issue < cnt_l then
+              tab_ra <= s_issue(7 downto 0) & '0';
+              spv(1) <= '1'; spi(1) <= s_issue(7 downto 0);
+              s_issue <= s_issue + 1;
+            end if;
           end if;
       end case;
       end if;
