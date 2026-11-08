@@ -1149,6 +1149,9 @@ architecture Behavioral of viciv is
   signal rl_en_s        : std_logic_vector(1 downto 0) := "00";
   signal list_found     : std_logic := '0';           -- LIST token seen in this row's fetch
   signal list_lo_fc     : std_logic := '0';           -- last even row byte was $FC
+  signal list_lo_ff     : std_logic := '0';           -- last even row byte was $FF
+  signal row_ff         : std_logic := '0';           -- $FFFF (end of row) seen first, at list_pos
+  signal row_short      : std_logic := '0';           -- v2 objects replace the row's $FFFF
   signal list_pos       : unsigned(9 downto 0) := (others => '0');   -- buffer index of LIST
   signal row_list       : std_logic := '0';           -- current character row is expanded
   signal row_scr_base   : unsigned(19 downto 0) := (others => '0');
@@ -1165,7 +1168,8 @@ architecture Behavioral of viciv is
   signal list_in_exp    : std_logic := '0';
   signal list_save_armed : std_logic := '0';
   signal list_saved_max : unsigned(9 downto 0) := (others => '0');
-  signal exp_out_len, exp_baddr : unsigned(9 downto 0);
+  signal exp_out_len    : unsigned(10 downto 0);
+  signal exp_baddr      : unsigned(9 downto 0);
   signal exp_maddr      : unsigned(19 downto 0);
   signal exp_caddr      : unsigned(15 downto 0);
   signal exp_bscreen, exp_bcolour : unsigned(7 downto 0);
@@ -1180,7 +1184,9 @@ architecture Behavioral of viciv is
   signal rv2_s, hold_s  : std_logic_vector(1 downto 0) := "00";
   signal exp_copy_start, exp_copying, exp_start_scan : std_logic := '0';
   signal exp_row        : unsigned(7 downto 0) := (others => '0');
-  signal row_end_pos    : unsigned(9 downto 0) := (others => '0');
+  signal row_end_pos    : unsigned(10 downto 0) := (others => '0');  -- saturates at 1024
+  signal exp_mfree      : std_logic;
+  constant RRB_LIST_LIMIT : integer := 1020;          -- row buffer limit of the expansion
 
   signal reg_alpha_delay : unsigned(3 downto 0) := x"1";
 
@@ -1321,7 +1327,7 @@ begin
   exp_ent_addr <= row_scr_base + list_pos + 2;
 
   rrblist0 : entity work.rrb_list_expander
-    generic map (MLAT => 3, CLAT => 1, LIMIT => 1020)
+    generic map (MLAT => 3, CLAT => 1, LIMIT => RRB_LIST_LIMIT)
     port map (clk => pixelclock, start => exp_start, abort => exp_abort, ent_addr => exp_ent_addr,
               out_start => list_pos, busy => exp_busy, done => exp_done, out_len => exp_out_len,
               mreq => exp_mreq, maddr => exp_maddr, mdata => final_ramdata,
@@ -1329,7 +1335,7 @@ begin
               bwe => exp_bwe, baddr => exp_baddr, bscreen => exp_bscreen, bcolour => exp_bcolour,
               scan_en => rv2_s(1), start_scan => exp_start_scan, row => exp_row,
               obj_count => obj_count, copy_start => exp_copy_start, tab_addr => obj_tab_addr,
-              copying => exp_copying);
+              mfree => exp_mfree, copying => exp_copying);
 
   -- colour row buffer: written by the expander, read like colour RAM (one cycle) at the row
   -- index of the painter's colour RAM address; selected for the expanded part of a list row
@@ -4301,14 +4307,21 @@ begin
         screen_ram_buffer_write_address <= exp_baddr;
         screen_ram_buffer_din <= exp_bscreen;
       end if;
-      if final_ramaccess_is_screen_row_fetch = '1' then
-        row_end_pos <= final_ramaccess_screen_row_buffer_address + 1;    -- v2: after the row
+      if final_ramaccess_is_screen_row_fetch = '1' and row_end_pos(10) = '0' then
+        -- v2: after the row; sticky at 1024 if the row fills (or wraps) the 1 KB buffer
+        row_end_pos <= ('0' & final_ramaccess_screen_row_buffer_address) + 1;
       end if;
-      if final_ramaccess_is_screen_row_fetch = '1' and list_found = '0' then
+      -- the row's first LIST token ($FFFC) or end of row ($FFFF), whichever comes first: nothing
+      -- after an end of row counts (a later LIST token neither)
+      if final_ramaccess_is_screen_row_fetch = '1' and list_found = '0' and row_ff = '0' then
         if final_ramaccess_screen_row_buffer_address(0) = '0' then
           if final_ramdata = x"FC" then list_lo_fc <= '1'; else list_lo_fc <= '0'; end if;
+          if final_ramdata = x"FF" then list_lo_ff <= '1'; else list_lo_ff <= '0'; end if;
         elsif list_lo_fc = '1' and final_ramdata = x"FF" then
           list_found <= '1';
+          list_pos <= final_ramaccess_screen_row_buffer_address - 1;
+        elsif list_lo_ff = '1' and final_ramdata = x"FF" then
+          row_ff <= '1';                          -- v2: the objects replace this $FFFF
           list_pos <= final_ramaccess_screen_row_buffer_address - 1;
         end if;
       end if;
@@ -4378,6 +4391,7 @@ begin
             colourramaddress <= to_unsigned(safe_to_integer(colour_ram_base) + safe_to_integer(first_card_of_row),16);
             -- K325T list mode: a new row, no LIST token seen yet
             list_found <= '0'; list_lo_fc <= '0'; row_list <= '0';
+            list_lo_ff <= '0'; row_ff <= '0'; row_short <= '0'; row_end_pos <= (others => '0');
             row_scr_base <= screen_row_current_address;
             exp_row <= display_row_number;            -- v2: character row of this fetch
 
@@ -4495,19 +4509,34 @@ begin
         when ListWait =>
           -- K325T list mode: let the last row bytes land in the buffer (LIST detection), then
           -- expand the lists or go straight to painting
-          -- v2: rows without a LIST token get the global objects after their last token; with
-          -- v1 off a LIST token only marks where they go.  No expansion while the table copy
-          -- runs (top of the frame: invisible rows; the first text row is fetched again).
+          -- v2: rows without a LIST token get the global objects at their first $FFFF (which
+          -- the objects' GOTOX overwrites; the expansion ends with its own $FFFF) or else after
+          -- their last token; with v1 off a LIST token only marks where they go.  No append
+          -- point beyond LIMIT - 2 (a full row is painted plainly).
+          -- While the table copy runs (top of the frame), the expander cannot start.  Every
+          -- line above the text area is a forced badline whose buffer the next line fetches
+          -- again: paint it plainly at once (painting and the sprite fetches keep their time; the
+          -- copy uses the Idle time after them).  The fetch that is kept for the first text row
+          -- (from the line just before it on) waits here for the copy, which gets the chip RAM
+          -- port in this state (exp_mfree).  If the copy is not done by the next raster line, the
+          -- line start takes the FSM out of this state (no assignment here) and the row is
+          -- painted plainly.
           if list_wait /= 0 then
             list_wait <= list_wait - 1;
-          elsif exp_copying = '1' then
+          elsif exp_copying = '1' and before_y_chargen_start = '1' and justbefore_y_chargen_start = '0' then
             raster_fetch_state <= FetchFirstCharacter;
+          elsif exp_copying = '1' then
+            null;
           elsif list_found = '1' and (rl_en_s(1) = '1' or rv2_s(1) = '1') then
             exp_start <= '1'; expanding <= '1'; row_list <= '1';
             exp_start_scan <= not rl_en_s(1);
             raster_fetch_state <= ListRun;
-          elsif rv2_s(1) = '1' then
-            list_pos <= row_end_pos;
+          elsif rv2_s(1) = '1' and row_ff = '1' and list_pos <= to_unsigned(RRB_LIST_LIMIT - 2, 10) then
+            row_short <= '1';                     -- keep the short row's row advance
+            exp_start <= '1'; exp_start_scan <= '1'; expanding <= '1'; row_list <= '1';
+            raster_fetch_state <= ListRun;
+          elsif rv2_s(1) = '1' and row_ff = '0' and row_end_pos <= to_unsigned(RRB_LIST_LIMIT - 2, 11) then
+            list_pos <= row_end_pos(9 downto 0);
             exp_start <= '1'; exp_start_scan <= '1'; expanding <= '1'; row_list <= '1';
             raster_fetch_state <= ListRun;
           else
@@ -4734,8 +4763,13 @@ begin
           end if;
           if screen_ram_is_ff='1' and screen_ram_high_is_ff='1' then
             if row_list = '1' and screen_ram_buffer_read_address > list_pos then
-              -- K325T list mode: end of the expanded row (the row advance stays LINESTEP)
+              -- K325T list mode: end of the expanded row (the row advance stays LINESTEP, or
+              -- for a short row whose $FFFF the v2 objects replaced: as without them)
               list_line_end <= '1';
+              if row_short = '1' then
+                short_line <= '1';
+                short_line_length <= safe_to_integer(list_pos) + 2;
+              end if;
             else
             -- 16-bit Character is $FFFF, which is end of line marker.
             -- So remember that this line is short, and don't add the virtual
@@ -5535,6 +5569,13 @@ begin
           exp_abort <= '1'; expanding <= '0'; row_list <= '0';
         end if;
       end if;
+      -- K325T list mode: with RRB overtime allowed (the default) the line start above also takes
+      -- the FSM out of ListRun (ListRun assigns no state until exp_done), but without the abort:
+      -- cut the expansion off here too, so the expander never reads chip RAM in the next
+      -- line's fetch states
+      if is_fetch_start='1' and last_was_fetch_start='0' and expanding = '1' and exp_done = '0' then
+        exp_abort <= '1'; expanding <= '0'; row_list <= '0';
+      end if;
       
       -- Push sprite data out in a drive cycle to improve timing closure.
       if sprite_fetch_drive = '1' then
@@ -6128,6 +6169,32 @@ begin
       end if;
     end if;
   end process;
+
+  -- K325T list mode v2: the table copy may use the chip RAM port in a cycle t only if
+  -- exp_mfree(t) = '1'.  Proof that its read can never meet a VIC-IV read: the expander's
+  -- mreq/maddr are registered, so a copy read decided at t is on next_ramaddress (= the port,
+  -- chipram_address) in cycle t+1.  The VIC-IV reads in cycle c only if
+  --   (a) this_ramaccess_is_screen_row_fetch(c) = '1' (the row fetch), or
+  --   (b) raster_fetch_state(c) is one of the states listed in the mux below (glyphs: FetchBitmapData,
+  --       FetchTextCellColourAndSource, PaintMemWait/2, PaintFullColourFetch; sprites/bitplanes:
+  --       SpritePointerFetch2, SpritePointerCompute1, SpriteDataFetch/2); every other state
+  --       leaves the address alone and consumes no data addressed in an mfree state.
+  -- (a) this_ramaccess_is_screen_row_fetch(t+1) = next_ramaccess_is_screen_row_fetch(t), which
+  --     exp_mfree(t) requires to be '0'.
+  -- (b) exp_mfree(t) requires raster_fetch_state(t) in {Idle, ListWait, ListRun}.  The only
+  --     successors in one cycle: Idle -> Idle (its case arm assigns nothing); ListWait ->
+  --     ListWait, ListRun, FetchFirstCharacter; ListRun -> ListRun, FetchFirstCharacter; and from
+  --     any state the line start / restart -> raster_fetch_state_init in {FetchScreenRamLine,
+  --     FetchFirstCharacter}.  None of these is a reading state, so state(t+1) issues no read.
+  --     (Their first reads come later: FetchScreenRamLine sets next_ at t+1 -> this_ at t+3;
+  --     FetchFirstCharacter needs 4 more states before FetchTextCellColourAndSource.)
+  -- The expander's own entry/object reads are decided in ListRun (the VIC-IV starts it only from
+  -- ListWait and leaves ListRun only on exp_done or a line start, which aborts it in the same
+  -- edge: its last read is then on the port in the first cycle of FetchScreenRamLine or
+  -- FetchFirstCharacter, not a reading state either).
+  exp_mfree <= '1' when (raster_fetch_state = Idle or raster_fetch_state = ListWait
+                         or raster_fetch_state = ListRun)
+                        and next_ramaccess_is_screen_row_fetch = '0' else '0';
 
   -- ramaddress mux
   -- This is pulled out into a combinatorial section so that ramaddress changes as soon as the raster_fetch_state

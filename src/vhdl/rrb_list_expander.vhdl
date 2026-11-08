@@ -17,9 +17,12 @@
 -- One byte per cycle.  If the buffer would overflow (out position > LIMIT) the expansion ends
 -- there with the end-of-line token (like running out of RRB time).
 --
--- List mode v2 (global object table, XCTL bit 6): once per frame (copy_start, in the vertical
--- blank) the unit copies obj_count 16-byte objects from chip RAM at tab_addr into its own BRAM
--- (a consistent snapshot: the CPU can rewrite the table at any time).  When a row is expanded
+-- List mode v2 (global object table, XCTL bit 6): once per frame (copy_start, top of the frame)
+-- the unit copies obj_count 16-byte objects from chip RAM at tab_addr into its own table (LUT
+-- RAM, 512 x 64 bits; a consistent snapshot: the CPU can rewrite the table at any time).  The
+-- address and the count are latched at the copy start; every scan uses the latched count.  The
+-- copy issues a chip RAM read only in cycles with mfree = '1' (the VIC-IV's port is idle) and
+-- stalls otherwise; copying stays high until the last table word is written.  When a row is expanded
 -- with scan_en set, after the row's own lists (or right away with start_scan: rows without a
 -- LIST token) it scans that table: every object whose Y range covers character row `row`
 -- becomes one or two synthesised entries (the object's top part with Y offset -(y mod 8) and
@@ -28,7 +31,7 @@
 --   +0  X 9..0, bit 10 REL (X = previous table object's X + signed offset)
 --   +2  Y 9..0 (signed, pixel rows from the top of character row 0), bit 10 REL (as X)
 --   +4  draw mask (ANDed with the computed one; 0 = hidden)
---   +5  height in character rows (0 = 1)
+--   +5  height in character rows, bits 5..0 (0 = 1; bits 7..6 ignored)
 --   +6  bits 3..0 screen address 19..16, 4 FLIPX, 5 FLIPY, 6 transparent, 7 behind (v1 w1 high)
 --   +7  reserved (collision group)
 --   +8  screen address 15..0 of the tokens of object row 0
@@ -50,7 +53,7 @@ entity rrb_list_expander is
     out_start : in  unsigned(9 downto 0);             -- row buffer index of the LIST token
     busy      : out std_logic;
     done      : out std_logic;                        -- one cycle when finished
-    out_len   : out unsigned(9 downto 0);             -- buffer index after the end-of-line token
+    out_len   : out unsigned(10 downto 0);            -- buffer index after the end-of-line token (<= LIMIT + 4)
     -- chip RAM (read only)
     mreq      : out std_logic;
     maddr     : out unsigned(19 downto 0);
@@ -70,6 +73,7 @@ entity rrb_list_expander is
     obj_count  : in  unsigned(7 downto 0) := (others => '0');
     copy_start : in  std_logic := '0';               -- one cycle: snapshot the table
     tab_addr   : in  unsigned(19 downto 0) := (others => '0');
+    mfree      : in  std_logic := '1';               -- chip RAM port free for the copy now
     copying    : out std_logic
   );
 end entity;
@@ -118,6 +122,7 @@ architecture rtl of rrb_list_expander is
   signal cp_run, cp_pend : std_logic := '0';
   signal cp_addr  : unsigned(19 downto 0) := (others => '0');
   signal cp_n, cp_issue : unsigned(12 downto 0) := (others => '0');
+  signal cp_count : unsigned(7 downto 0) := (others => '0');    -- object count of the snapshot
   type cpv_t is array (1 to MLAT) of std_logic;
   type cpi_t is array (1 to MLAT) of unsigned(11 downto 0);
   signal cpv      : cpv_t := (others => '0');
@@ -157,9 +162,10 @@ architecture rtl of rrb_list_expander is
   end function;
 begin
   busy <= '0' when state = Idle else '1';
-  copying <= cp_run or cp_pend or copy_start;          -- (the VIC-IV starts no expansion then)
+  -- (the VIC-IV starts no expansion then); tab_we: the last table word is written in this cycle
+  copying <= cp_run or cp_pend or copy_start or tab_we;
 
-  -- object table BRAM (simple dual port, registered read)
+  -- object table: LUT RAM (simple dual port, registered read)
   process (clk) begin
     if rising_edge(clk) then
       if tab_we = '1' then
@@ -214,12 +220,15 @@ begin
         cp_pend <= '0'; cp_run <= '1';
         cp_addr <= tab_addr; cp_issue <= (others => '0');
         cp_n <= '0' & obj_count & "0000";        -- 16 bytes per object
+        cp_count <= obj_count;                   -- part of the snapshot (scans use this count)
       end if;
       if cp_run = '1' then
         if cp_issue /= cp_n(12 downto 0) then
-          mreq <= '1'; maddr <= cp_addr + cp_issue;
-          cpv(1) <= '1'; cpi(1) <= cp_issue(11 downto 0);
-          cp_issue <= cp_issue + 1;
+          if mfree = '1' then                    -- else stall: the VIC-IV uses the port now
+            mreq <= '1'; maddr <= cp_addr + cp_issue;
+            cpv(1) <= '1'; cpi(1) <= cp_issue(11 downto 0);
+            cp_issue <= cp_issue + 1;
+          end if;
         else
           -- done once no request is in flight (cpv(MLAT) returns in this cycle)
           cp_run <= '0';
@@ -266,7 +275,7 @@ begin
         end if;
       end if;
 
-      -- v2 scan pipeline (BRAM read: address registered here, data two edges later)
+      -- v2 scan pipeline (table read: address registered here, data two edges later)
       spv(2) <= spv(1); spi(2) <= spi(1);
       spv(1) <= '0';
 
@@ -281,7 +290,7 @@ begin
             eaddr <= ent_addr; opos <= out_start; last_x <= (others => '0'); full <= '0';
             ent_req <= 0; ent_got <= 0;
             scanning <= '0'; scan_after <= scan_en;
-            row_l <= row; cnt_l <= '0' & obj_count;
+            row_l <= row; cnt_l <= '0' & cp_count;   -- the snapshot's count, not the live one
             if start_scan = '1' then
               state <= ScanStart;
             else
@@ -360,7 +369,7 @@ begin
           state <= Finish1;
         when Finish1 =>
           bwe <= '1'; baddr <= opos + 1; bscreen <= x"FF"; bcolour <= x"00";
-          out_len <= opos + 2;
+          out_len <= ('0' & opos) + 2;
           state <= Fin;
         when Fin =>
           done <= '1';
@@ -449,7 +458,12 @@ begin
           ent(3) <= h_flags(7 downto 4) & pa_addr(19 downto 16);
           ent(4) <= pa_addr(7 downto 0); ent(5) <= pa_addr(15 downto 8);
           ent(6) <= pa_col(7 downto 0); ent(7) <= pa_col(15 downto 8);
-          if h_pa = '1' and ma /= x"00" then
+          if opos > to_unsigned(LIMIT - 2, 10) then
+            -- buffer limit as in EntWait (a GOTOX + tokens no longer fit): end the row here,
+            -- also instead of resuming the scan
+            h_pa <= '0'; h_pb <= '0';
+            state <= Finish0;
+          elsif h_pa = '1' and ma /= x"00" then
             h_pa <= '0';
             ent(1) <= h_o & (not fy) & "00" & h_x(9 downto 8);
             ent(2) <= ma;
