@@ -212,6 +212,12 @@ entity viciv is
     diag_sel : in unsigned(4 downto 0) := (others => '0');        -- counter index
     diag_clr : in std_logic := '0';                               -- toggles: clear all counters
     diag_val : out unsigned(15 downto 0) := (others => '0');      -- selected counter (registered)
+    -- K325T list mode v2 collisions (rrb_list_expander; read at $FFD71A0-C3 via soft_rtc)
+    col_bits : out std_logic_vector(255 downto 0) := (others => '0');
+    col_count : out unsigned(7 downto 0) := (others => '0');
+    col_toggle : out std_logic := '0';
+    col_pidx : in unsigned(7 downto 0) := (others => '0');
+    col_pdata : out unsigned(7 downto 0) := (others => '1');
     charrom_fastio_rdata : out std_logic_vector(7 downto 0);
     charrom_cs : in std_logic;
 
@@ -1192,6 +1198,7 @@ architecture Behavioral of viciv is
   -- list mode v2: object table snapshot per frame, scanned for every CHR16 row
   signal rv2_s, hold_s  : std_logic_vector(1 downto 0) := "00";
   signal exp_copy_start, exp_copying, exp_start_scan : std_logic := '0';
+  signal exp_col_tick : std_logic := '0';             -- v2 collisions: one pass per frame
   signal exp_row        : unsigned(7 downto 0) := (others => '0');
   signal row_end_pos    : unsigned(10 downto 0) := (others => '0');  -- saturates at 1024
   signal exp_mfree      : std_logic;
@@ -1438,7 +1445,9 @@ begin
               scan_en => rv2_s(1), start_scan => exp_start_scan, row => exp_row,
               obj_count => obj_count, copy_start => exp_copy_start, tab_addr => obj_tab_addr,
               mfree => exp_mfree, copying => exp_copying,
-              ovf => exp_ovf, part => exp_part, cstall => exp_cstall);
+              ovf => exp_ovf, part => exp_part, cstall => exp_cstall,
+              col_tick => exp_col_tick, col_bits => col_bits, col_count => col_count,
+              col_toggle => col_toggle, col_pidx => col_pidx, col_pdata => col_pdata);
 
   -- K325T list mode diagnostic counters (read at $FFD71E0-3 via soft_rtc).  Stage 1 registers
   -- one bit per event (dg_ev); stage 2 counts them (16 bits, saturating at $FFFF, except the
@@ -3851,6 +3860,11 @@ begin
       if external_frame_y_zero = '0' and last_external_frame_y_zero='1'
          and rv2_s(1) = '1' and hold_s(1) = '0' then
         exp_copy_start <= '1';
+      end if;
+      -- v2 collisions: a pass per frame (after the copy; with HOLD on the held snapshot)
+      exp_col_tick <= '0';
+      if external_frame_y_zero = '0' and last_external_frame_y_zero='1' and rv2_s(1) = '1' then
+        exp_col_tick <= '1';
       end if;
       if external_frame_y_zero = '0' and last_external_frame_y_zero='1' then
         -- Start of next frame

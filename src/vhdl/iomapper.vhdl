@@ -412,7 +412,13 @@ entity iomapper is
     xobj_out : out unsigned(28 downto 0) := (others => '0');  -- K325T list mode v2 registers
     diag_sel_out : out unsigned(4 downto 0) := (others => '0');  -- K325T list mode diagnostics
     diag_clr_out : out std_logic := '0';
-    diag_val_in : in unsigned(15 downto 0) := (others => '0')
+    diag_val_in : in unsigned(15 downto 0) := (others => '0');
+    -- K325T list mode v2 collisions (VIC-IV pixel clock; soft_rtc copies them on col_toggle)
+    col_bits_in : in std_logic_vector(255 downto 0) := (others => '0');
+    col_count_in : in unsigned(7 downto 0) := (others => '0');
+    col_toggle_in : in std_logic := '0';
+    col_pidx_out : out unsigned(7 downto 0) := (others => '0');
+    col_pdata_in : in unsigned(7 downto 0) := (others => '1')
 
     );
 end iomapper;
@@ -613,6 +619,7 @@ architecture behavioral of iomapper is
 
   signal cia1_irq : std_logic;
   signal ethernet_irq : std_logic := '1';
+  signal rtc_irq : std_logic := '1';           -- K325T: list mode v2 collision IRQ (soft_rtc)
   signal uart_irq : std_logic;
   signal iec_irq : std_logic := '1';
 
@@ -707,7 +714,7 @@ begin
 
 
   -- IRQ line is wire-anded together as if it had a pullup.
-  irq <= cia1_irq and ethernet_irq and uart_irq and iec_irq;
+  irq <= cia1_irq and ethernet_irq and uart_irq and iec_irq and rtc_irq;
 
   block2: block
   begin
@@ -1391,7 +1398,10 @@ begin
         xobj_out => xobj_out,
         diag_sel_out => diag_sel_out,
         diag_clr_out => diag_clr_out,
-        diag_val_in => diag_val_in);
+        diag_val_in => diag_val_in,
+        col_bits_in => col_bits_in, col_count_in => col_count_in, col_toggle_in => col_toggle_in,
+        col_pidx_out => col_pidx_out, col_pdata_in => col_pdata_in,
+        irq_n => rtc_irq);
   end generate;
 
   -- XXX I2C bus of the MEGAphone R4 is currently disabled, as it is tied to

@@ -721,6 +721,9 @@ architecture Behavioral of machine is
   signal rrb_diag_sel : unsigned(4 downto 0);       -- K325T list mode diagnostics ($FFD71E0-3)
   signal rrb_diag_clr : std_logic;
   signal rrb_diag_val : unsigned(15 downto 0);
+  signal col_bits : std_logic_vector(255 downto 0);  -- K325T list mode v2 collisions
+  signal col_count, col_pidx, col_pdata : unsigned(7 downto 0);
+  signal col_toggle : std_logic;
   signal pixel_frame_toggle : std_logic;
   signal pixel_newframe : std_logic;
   signal pixel_newraster : std_logic;
@@ -1396,6 +1399,8 @@ begin
       diag_sel => rrb_diag_sel,
       diag_clr => rrb_diag_clr,
       diag_val => rrb_diag_val,
+      col_bits => col_bits, col_count => col_count, col_toggle => col_toggle,
+      col_pidx => col_pidx, col_pdata => col_pdata,
       pixelclock      => pixelclock,
       cpuclock        => cpuclock,
       all_pause => all_pause,
@@ -1801,6 +1806,8 @@ begin
       diag_sel_out => rrb_diag_sel,
       diag_clr_out => rrb_diag_clr,
       diag_val_in => rrb_diag_val,
+      col_bits_in => col_bits, col_count_in => col_count, col_toggle_in => col_toggle,
+      col_pidx_out => col_pidx, col_pdata_in => col_pdata,
       colourram_at_dc00 => colourram_at_dc00,
       drive_led0 => drive_led0,
       drive_led2 => drive_led2,
