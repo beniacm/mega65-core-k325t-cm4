@@ -44,7 +44,11 @@ architecture rtl of shadowram is
   signal lo_doa, lo_dob : unsigned(7 downto 0);
   signal lo_dob32 : unsigned(31 downto 0);
   type q_t is array (0 to 3) of unsigned(7 downto 0);
-  signal mid_qa, hi_qa, mid_qb, hi_qb : q_t := (others => x"00");
+  signal mid_qa, mid_qb : q_t := (others => x"00");
+  signal hi_qa, hi_qb : q_t;
+  type qq_t is array (0 to 3) of q_t;
+  signal hi_qqa, hi_qqb : qq_t := (others => (others => x"00"));
+  signal hbank_a, hbank_b : unsigned(1 downto 0) := "00";       -- registered: hi bank
   signal sel_a, sel_b : std_logic_vector(1 downto 0) := "00";   -- registered: 00 lo, 01 mid, 1x hi
   signal byte_a, byte_b : unsigned(1 downto 0) := "00";         -- registered lane of the byte
 
@@ -69,12 +73,12 @@ begin
               writes => writes, no_writes => no_writes, doa => lo_doa,
               ClkB => ClkB, addressb => lo_addrb, dob => lo_dob, dob32 => lo_dob32);
 
-  -- mid (128 KB) and hi (512 KB): four byte lanes each
+  -- mid (128 KB) and hi (512 KB): four byte lanes each; every array 32K deep (hi: four banks
+  -- per lane, address bits 18..17), so that Vivado never cascades two RAMB36 (a cascaded pair
+  -- once failed DRC REQP-1962: ADDR15 of the pair tied differently)
   lanes : for l in 0 to 3 generate
     type midl_t is array (0 to 32767) of unsigned(7 downto 0);
-    type hil_t is array (0 to 131071) of unsigned(7 downto 0);
     shared variable midl : midl_t;
-    shared variable hil : hil_t;
   begin
     process (ClkA)
     begin
@@ -83,31 +87,49 @@ begin
           midl(to_integer(aa(16 downto 2))) := dia;
         end if;
         mid_qa(l) <= midl(to_integer(aa(16 downto 2)));
-        if wea /= '0' and aa(19) = '1' and aa(1 downto 0) = to_unsigned(l, 2) then
-          hil(to_integer(aa(18 downto 2))) := dia;
-        end if;
-        hi_qa(l) <= hil(to_integer(aa(18 downto 2)));
       end if;
     end process;
     process (ClkB)
     begin
       if rising_edge(ClkB) then
         mid_qb(l) <= midl(to_integer(addressb(16 downto 2)));
-        hi_qb(l) <= hil(to_integer(addressb(18 downto 2)));
       end if;
     end process;
+    hibanks : for k in 0 to 3 generate
+      type hil_t is array (0 to 32767) of unsigned(7 downto 0);
+      shared variable hil : hil_t;
+    begin
+      process (ClkA)
+      begin
+        if rising_edge(ClkA) then
+          if wea /= '0' and aa(19) = '1' and aa(18 downto 17) = to_unsigned(k, 2)
+             and aa(1 downto 0) = to_unsigned(l, 2) then
+            hil(to_integer(aa(16 downto 2))) := dia;
+          end if;
+          hi_qqa(k)(l) <= hil(to_integer(aa(16 downto 2)));
+        end if;
+      end process;
+      process (ClkB)
+      begin
+        if rising_edge(ClkB) then
+          hi_qqb(k)(l) <= hil(to_integer(addressb(16 downto 2)));
+        end if;
+      end process;
+    end generate;
+    hi_qa(l) <= hi_qqa(to_integer(hbank_a))(l);
+    hi_qb(l) <= hi_qqb(to_integer(hbank_b))(l);
   end generate;
 
   process (ClkA)
   begin
     if rising_edge(ClkA) then
-      sel_a <= region(aa); byte_a <= aa(1 downto 0);
+      sel_a <= region(aa); byte_a <= aa(1 downto 0); hbank_a <= aa(18 downto 17);
     end if;
   end process;
   process (ClkB)
   begin
     if rising_edge(ClkB) then
-      sel_b <= region(addressb); byte_b <= addressb(1 downto 0);
+      sel_b <= region(addressb); byte_b <= addressb(1 downto 0); hbank_b <= addressb(18 downto 17);
     end if;
   end process;
 
