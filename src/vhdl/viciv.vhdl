@@ -204,6 +204,7 @@ entity viciv is
     fast_rrb_en : in std_logic := '0';        -- XCTL bit 4: paint 2 pixels per cycle (K325T)
     rrb_list_en : in std_logic := '0';        -- XCTL bit 5: RRB list mode (K325T, upstream #747)
     fast_token_en : in std_logic := '0';      -- XCTL bit 7 (with bit 4): fast token path (K325T)
+    clear_unpainted_en : in std_logic := '0'; -- XCTL bit 3: unpainted pixels show as background (K325T)
     rrb_v2_en : in std_logic := '0';          -- XCTL bit 6: list mode v2, global object table
     obj_tab_addr : in unsigned(19 downto 0) := (others => '0');   -- $FFD71F8-A
     obj_count : in unsigned(7 downto 0) := (others => '0');       -- $FFD71FB
@@ -1011,6 +1012,20 @@ architecture Behavioral of viciv is
   signal rb_we0, rb_we1 : std_logic := '0';
   signal rb_dout0, rb_dout1 : unsigned(17 downto 0) := (others => '0');
   signal rb_rsel : std_logic := '0';
+  -- K325T XCTL bit 3 (cu_*): a pixel not painted in this painting of its buffer half shows as
+  -- background (screen colour, alpha $FF, not foreground), and the line runs to the full text
+  -- width.  One valid bit per pixel of each half and bank, in flip-flops: the write half's bits
+  -- are cleared a few cycles after the line start (after the display has passed the end of the
+  -- text area, before the painting's first write), every raster buffer write sets its bit
+  -- (one cycle later), the display reads the bit with the pixel.  Off: nothing changes.
+  signal cu_s : std_logic_vector(1 downto 0) := "00";
+  signal cu_v0, cu_v1 : std_logic_vector(1023 downto 0) := (others => '0');   -- even / odd bank
+  signal cu_we0, cu_we1 : std_logic := '0';
+  signal cu_a0, cu_a1 : unsigned(9 downto 0) := (others => '0');
+  signal cu_clr : std_logic := '0';
+  signal cu_clr_half : std_logic := '0';
+  signal cu_clr_cnt : integer range 0 to 7 := 0;
+  signal cu_vq : std_logic := '1';
   signal rb_raddr : unsigned(10 downto 0) := (others => '0');
 
   -- one painted pixel as the raster buffer word (bit 17 alt palette, 16..9 alpha,
@@ -1357,6 +1372,32 @@ begin
         rb_din1 <= raster_buffer_write_data;  rb_we1 <= raster_buffer_write;
         rb_din0 <= raster_buffer_write_data2; rb_we0 <= raster_buffer_write2;
       end if;
+    end if;
+  end process;
+
+  -- K325T XCTL bit 3: valid bits of the raster buffer (see cu_s)
+  process (pixelclock)
+    variable vb : std_logic;
+  begin
+    if rising_edge(pixelclock) then
+      cu_we0 <= rb_we0; cu_a0 <= rb_addr0(9 downto 0);
+      cu_we1 <= rb_we1; cu_a1 <= rb_addr1(9 downto 0);
+      if cu_clr = '1' then                       -- bit 9 of the index is the buffer half
+        if cu_clr_half = '0' then
+          cu_v0(511 downto 0) <= (others => '0'); cu_v1(511 downto 0) <= (others => '0');
+        else
+          cu_v0(1023 downto 512) <= (others => '0'); cu_v1(1023 downto 512) <= (others => '0');
+        end if;
+      end if;
+      if cu_we0 = '1' then cu_v0(to_integer(cu_a0)) <= '1'; end if;
+      if cu_we1 = '1' then cu_v1(to_integer(cu_a1)) <= '1'; end if;
+      -- with the pixel the display reads (same address and latency as the buffer's read port)
+      if raster_buffer_read_address_next(0) = '1' then
+        vb := cu_v1(to_integer(raster_buffer_read_address_next(10 downto 1)));
+      else
+        vb := cu_v0(to_integer(raster_buffer_read_address_next(10 downto 1)));
+      end if;
+      cu_vq <= vb;
     end if;
   end process;
 
@@ -3927,7 +3968,8 @@ begin
         raster_buffer_max_write_address_prev <= raster_buffer_max_write_address_hold;
         report "setting raster_buffer_max_write_address_prev to $" & to_hstring(raster_buffer_max_write_address_hold);
       end if;
-      if raster_buffer_read_address_next(9 downto 0) > raster_buffer_max_write_address_prev then
+      if raster_buffer_read_address_next(9 downto 0) > raster_buffer_max_write_address_prev
+         and cu_s(1) = '0' then                  -- (K325T XCTL bit 3: the full text width)
         report "stopping character generator due to buffer exhaustion"
           severity note;
         chargen_active <= '0';
@@ -3994,6 +4036,8 @@ begin
 
         -- K325T fast token path: off until this line's FetchFirstCharacter
         fp_line <= '0'; fp_dec <= DIdle; fp_goto_pend <= '0';
+        -- K325T XCTL bit 3: clear the new write half's valid bits in 4 cycles
+        cu_clr_cnt <= 4;
 
         -- Reset glyph Y offset each raster line
         glyph_y_offset <= 0;
@@ -4305,6 +4349,15 @@ begin
         -- 9th bit indicates foreground for sprite collission handling
         pixel_is_background <= not raster_buffer_read_data(8);
         pixel_is_foreground <= raster_buffer_read_data(8);
+        -- K325T XCTL bit 3: a pixel this painting did not write is a background pixel (what a
+        -- painted background pixel of the screen colour shows)
+        if cu_s(1) = '1' and cu_vq = '0' then
+          pixel_colour <= screen_colour;
+          pixel_alpha <= x"FF";
+          pixel_alt_palette <= '0';
+          pixel_is_background <= '1';
+          pixel_is_foreground <= '0';
+        end if;
       end if;
 
       -- Make delayed versions of card number and x position so that we have time
@@ -6193,6 +6246,14 @@ begin
 
       rb_fast_s <= rb_fast_s(0) & fast_rrb_en;   -- K325T fast RRB
       fp_s <= fp_s(0) & fast_token_en;           -- K325T fast token path
+      cu_s <= cu_s(0) & clear_unpainted_en;      -- K325T XCTL bit 3
+      cu_clr <= '0';
+      if cu_clr_cnt /= 0 then
+        cu_clr_cnt <= cu_clr_cnt - 1;
+        if cu_clr_cnt = 1 then
+          cu_clr <= '1'; cu_clr_half <= raster_buffer_write_address(10);
+        end if;
+      end if;
       rb_double <= '0';
       raster_buffer_write2 <= '0';
       case paint_fsm_state is

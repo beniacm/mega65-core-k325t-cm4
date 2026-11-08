@@ -1391,6 +1391,7 @@ begin
       colour_ram_64k_en => xctl(2),
       fast_rrb_en => xctl(4),
       fast_token_en => xctl(7),
+      clear_unpainted_en => xctl(3),
       rrb_list_en => xctl(5),
       rrb_v2_en => xctl(6),
       obj_tab_addr => xobj(19 downto 0),
