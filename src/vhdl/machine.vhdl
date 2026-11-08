@@ -716,6 +716,7 @@ architecture Behavioral of machine is
   signal pixel_y : unsigned (11 downto 0);
   signal vicii_raster : unsigned (11 downto 0);
   signal xctl : unsigned(7 downto 0);               -- K325T extension control ($FFD71F0)
+  signal xobj : unsigned(28 downto 0);              -- K325T list mode v2 ($FFD71F8-FC)
   signal pixel_frame_toggle : std_logic;
   signal pixel_newframe : std_logic;
   signal pixel_newraster : std_logic;
@@ -1382,6 +1383,10 @@ begin
       colour_ram_64k_en => xctl(2),
       fast_rrb_en => xctl(4),
       rrb_list_en => xctl(5),
+      rrb_v2_en => xctl(6),
+      obj_tab_addr => xobj(19 downto 0),
+      obj_count => xobj(27 downto 20),
+      obj_hold => xobj(28),
       pixelclock      => pixelclock,
       cpuclock        => cpuclock,
       all_pause => all_pause,
@@ -1782,6 +1787,7 @@ begin
       hyppo_rdata => hyppo_rdata,
       hyppo_address => hyppo_address,
       xctl_out => xctl,
+      xobj_out => xobj,
       colourram_at_dc00 => colourram_at_dc00,
       drive_led0 => drive_led0,
       drive_led2 => drive_led2,

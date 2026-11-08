@@ -408,7 +408,8 @@ entity iomapper is
     hyppo_address : in std_logic_vector(13 downto 0);
 
     colourram_at_dc00 : in std_logic;
-    xctl_out : out unsigned(7 downto 0) := (others => '0')   -- K325T extension control
+    xctl_out : out unsigned(7 downto 0) := (others => '0');  -- K325T extension control
+    xobj_out : out unsigned(28 downto 0) := (others => '0')  -- K325T list mode v2 registers
 
     );
 end iomapper;
@@ -1383,7 +1384,8 @@ begin
         fastio_read => r,
         fastio_wdata => unsigned(data_i),
         std_logic_vector(fastio_rdata) => data_o,
-        xctl_out => xctl_out);
+        xctl_out => xctl_out,
+        xobj_out => xobj_out);
   end generate;
 
   -- XXX I2C bus of the MEGAphone R4 is currently disabled, as it is tied to

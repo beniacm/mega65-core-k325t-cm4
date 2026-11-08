@@ -12,9 +12,12 @@
 --   bit 0 = 1 MB chip RAM for the CPU/DMA, bit 1 = raster DMA list on,
 --   bit 2 = 64 KB colour RAM (VIC-IV, via xctl_out), bit 4 = fast RRB (VIC-IV paints
 --   2 pixels per cycle), bit 5 = RRB list mode (LIST token $FFFC in CHR16 rows, see the lab
---   repo's docs/rrb_list_mode.md); bit 3 is unused here (24 extra sprites on branch
---   k325t-extra-sprites)
+--   repo's docs/rrb_list_mode.md), bit 6 = RRB list mode v2 (global object table, below);
+--   bit 3 is unused here (24 extra sprites on branch k325t-extra-sprites)
 -- $FFD71F4-$FFD71F7: raster DMA list address (28 bits, little endian)
+-- $FFD71F8-$FFD71FA: list mode v2 object table address in chip RAM (20 bits, little endian)
+-- $FFD71FB: number of objects (0..255, 16 bytes each)
+-- $FFD71FC: bit 0 = HOLD: the VIC-IV keeps its last snapshot of the table (no copy per frame)
 -- (gs4510 snoops these writes and acts on them; the copies here are for reading back)
 -- All other addresses of the $FFD71xx page read 0.  Until the first write it reads an
 -- invalid date (day 0), which the ROM reports as "no RTC".
@@ -34,7 +37,8 @@ entity soft_rtc is
     fastio_read  : in  std_logic;
     fastio_wdata : in  unsigned(7 downto 0);
     fastio_rdata : out unsigned(7 downto 0);
-    xctl_out     : out unsigned(7 downto 0)
+    xctl_out     : out unsigned(7 downto 0);
+    xobj_out     : out unsigned(28 downto 0)    -- list mode v2 (VIC-IV): hold & count & table
   );
 end entity;
 
@@ -45,9 +49,11 @@ architecture rtl of soft_rtc is
   signal dow            : unsigned(7 downto 0) := x"00";
   signal tick_cnt       : integer range 0 to clock_frequency - 1 := 0;
   signal xctl           : unsigned(7 downto 0) := x"00";       -- $FFD71F0
-  constant XCTL_BITS    : unsigned(7 downto 0) := x"37";       -- implemented bits (bit 3: see branch k325t-extra-sprites)
+  constant XCTL_BITS    : unsigned(7 downto 0) := x"77";       -- implemented bits (bit 3: see branch k325t-extra-sprites)
   type rdl_t is array (0 to 3) of unsigned(7 downto 0);
   signal rdma_list      : rdl_t := (others => x"00");          -- $FFD71F4-7
+  signal obj_tab        : rdl_t := (others => x"00");          -- $FFD71F8-B (B: count)
+  signal obj_hold       : std_logic := '0';                    -- $FFD71FC bit 0
 
   -- BCD + 1 (no range check)
   function bcd_inc(v : unsigned(7 downto 0)) return unsigned is
@@ -78,9 +84,10 @@ architecture rtl of soft_rtc is
   end function;
 begin
   xctl_out <= xctl;
+  xobj_out <= obj_hold & obj_tab(3) & obj_tab(2)(3 downto 0) & obj_tab(1) & obj_tab(0);
 
   -- reads: combinational onto the shared fastio bus, 'Z' when not selected
-  process (cs, fastio_read, fastio_addr, sec, min, hour, day, month, year, dow, xctl, rdma_list) is
+  process (cs, fastio_read, fastio_addr, sec, min, hour, day, month, year, dow, xctl, rdma_list, obj_tab, obj_hold) is
   begin
     if cs = '1' and fastio_read = '1' then
       case fastio_addr(7 downto 0) is
@@ -96,6 +103,11 @@ begin
         when x"F5" => fastio_rdata <= rdma_list(1);
         when x"F6" => fastio_rdata <= rdma_list(2);
         when x"F7" => fastio_rdata <= rdma_list(3) and x"0F";
+        when x"F8" => fastio_rdata <= obj_tab(0);
+        when x"F9" => fastio_rdata <= obj_tab(1);
+        when x"FA" => fastio_rdata <= obj_tab(2) and x"0F";
+        when x"FB" => fastio_rdata <= obj_tab(3);
+        when x"FC" => fastio_rdata <= "0000000" & obj_hold;
         when others => fastio_rdata <= x"00";
       end case;
     else
@@ -109,8 +121,13 @@ begin
     if rising_edge(clock) then
       if reset_n = '0' then
         xctl <= x"00";
+        obj_tab <= (others => x"00"); obj_hold <= '0';
       elsif cs = '1' and fastio_write = '1' and fastio_addr(7 downto 0) = x"F0" then
         xctl <= fastio_wdata and XCTL_BITS;
+      elsif cs = '1' and fastio_write = '1' and fastio_addr(7 downto 2) = "111110" then
+        obj_tab(to_integer(fastio_addr(1 downto 0))) <= fastio_wdata;
+      elsif cs = '1' and fastio_write = '1' and fastio_addr(7 downto 0) = x"FC" then
+        obj_hold <= fastio_wdata(0);
       end if;
       if cs = '1' and fastio_write = '1' and fastio_addr(7 downto 2) = "111101" then
         rdma_list(to_integer(fastio_addr(1 downto 0))) <= fastio_wdata;

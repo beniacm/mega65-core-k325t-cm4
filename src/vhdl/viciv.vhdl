@@ -201,6 +201,10 @@ entity viciv is
     colour_ram_64k_en : in std_logic := '0';   -- XCTL bit 2 (K325T)
     fast_rrb_en : in std_logic := '0';        -- XCTL bit 4: paint 2 pixels per cycle (K325T)
     rrb_list_en : in std_logic := '0';        -- XCTL bit 5: RRB list mode (K325T, upstream #747)
+    rrb_v2_en : in std_logic := '0';          -- XCTL bit 6: list mode v2, global object table
+    obj_tab_addr : in unsigned(19 downto 0) := (others => '0');   -- $FFD71F8-A
+    obj_count : in unsigned(7 downto 0) := (others => '0');       -- $FFD71FB
+    obj_hold : in std_logic := '0';                               -- $FFD71FC bit 0
     charrom_fastio_rdata : out std_logic_vector(7 downto 0);
     charrom_cs : in std_logic;
 
@@ -1172,6 +1176,11 @@ architecture Behavioral of viciv is
   signal cbuf           : cbuf_t := (others => x"00");
   signal cbuf_dout      : unsigned(7 downto 0) := x"00";
   signal cbuf_sel       : std_logic := '0';
+  -- list mode v2: object table snapshot per frame, scanned for every CHR16 row
+  signal rv2_s, hold_s  : std_logic_vector(1 downto 0) := "00";
+  signal exp_copy_start, exp_copying, exp_start_scan : std_logic := '0';
+  signal exp_row        : unsigned(7 downto 0) := (others => '0');
+  signal row_end_pos    : unsigned(9 downto 0) := (others => '0');
 
   signal reg_alpha_delay : unsigned(3 downto 0) := x"1";
 
@@ -1317,7 +1326,10 @@ begin
               out_start => list_pos, busy => exp_busy, done => exp_done, out_len => exp_out_len,
               mreq => exp_mreq, maddr => exp_maddr, mdata => final_ramdata,
               caddr => exp_caddr, cdata => colourramdata_ram,
-              bwe => exp_bwe, baddr => exp_baddr, bscreen => exp_bscreen, bcolour => exp_bcolour);
+              bwe => exp_bwe, baddr => exp_baddr, bscreen => exp_bscreen, bcolour => exp_bcolour,
+              scan_en => rv2_s(1), start_scan => exp_start_scan, row => exp_row,
+              obj_count => obj_count, copy_start => exp_copy_start, tab_addr => obj_tab_addr,
+              copying => exp_copying);
 
   -- colour row buffer: written by the expander, read like colour RAM (one cycle) at the row
   -- index of the painter's colour RAM address; selected for the expanded part of a list row
@@ -3514,6 +3526,15 @@ begin
 
       -- If we got far along the last line to make it look real, and ...
       last_external_frame_y_zero <= external_frame_y_zero;
+      -- K325T list mode v2: snapshot the object table once per frame (top of the frame, far
+      -- from the first text row), unless the program holds it
+      rv2_s <= rv2_s(0) & rrb_v2_en;
+      hold_s <= hold_s(0) & obj_hold;
+      exp_copy_start <= '0';
+      if external_frame_y_zero = '0' and last_external_frame_y_zero='1'
+         and rv2_s(1) = '1' and hold_s(1) = '0' then
+        exp_copy_start <= '1';
+      end if;
       if external_frame_y_zero = '0' and last_external_frame_y_zero='1' then
         -- Start of next frame
         report "Starting new frame. ycounter_driver <= 0";
@@ -4270,6 +4291,7 @@ begin
       -- K325T list mode
       rl_en_s <= rl_en_s(0) & rrb_list_en;
       exp_start <= '0';
+      exp_start_scan <= '0';
       exp_abort <= '0';
       if exp_done = '1' then
         expanding <= '0';
@@ -4278,6 +4300,9 @@ begin
         screen_ram_buffer_write <= '1';
         screen_ram_buffer_write_address <= exp_baddr;
         screen_ram_buffer_din <= exp_bscreen;
+      end if;
+      if final_ramaccess_is_screen_row_fetch = '1' then
+        row_end_pos <= final_ramaccess_screen_row_buffer_address + 1;    -- v2: after the row
       end if;
       if final_ramaccess_is_screen_row_fetch = '1' and list_found = '0' then
         if final_ramaccess_screen_row_buffer_address(0) = '0' then
@@ -4354,6 +4379,7 @@ begin
             -- K325T list mode: a new row, no LIST token seen yet
             list_found <= '0'; list_lo_fc <= '0'; row_list <= '0';
             row_scr_base <= screen_row_current_address;
+            exp_row <= display_row_number;            -- v2: character row of this fetch
 
             -- Now ask for the first byte.  We indicate all details of this
             -- read so that it can be committed by the receiving side of the logic.
@@ -4440,7 +4466,7 @@ begin
           if (sixteenbit_charset='1' and end_of_row_16='1')
             or (sixteenbit_charset='0' and end_of_row='1') then
             -- All done, move to actual row fetch
-            if rl_en_s(1) = '1' and sixteenbit_charset = '1' then
+            if (rl_en_s(1) = '1' or rv2_s(1) = '1') and sixteenbit_charset = '1' then
               raster_fetch_state <= ListWait;         -- K325T list mode
               list_wait <= 5;
             else
@@ -4469,10 +4495,20 @@ begin
         when ListWait =>
           -- K325T list mode: let the last row bytes land in the buffer (LIST detection), then
           -- expand the lists or go straight to painting
+          -- v2: rows without a LIST token get the global objects after their last token; with
+          -- v1 off a LIST token only marks where they go.  No expansion while the table copy
+          -- runs (top of the frame: invisible rows; the first text row is fetched again).
           if list_wait /= 0 then
             list_wait <= list_wait - 1;
-          elsif list_found = '1' then
+          elsif exp_copying = '1' then
+            raster_fetch_state <= FetchFirstCharacter;
+          elsif list_found = '1' and (rl_en_s(1) = '1' or rv2_s(1) = '1') then
             exp_start <= '1'; expanding <= '1'; row_list <= '1';
+            exp_start_scan <= not rl_en_s(1);
+            raster_fetch_state <= ListRun;
+          elsif rv2_s(1) = '1' then
+            list_pos <= row_end_pos;
+            exp_start <= '1'; exp_start_scan <= '1'; expanding <= '1'; row_list <= '1';
             raster_fetch_state <= ListRun;
           else
             raster_fetch_state <= FetchFirstCharacter;
