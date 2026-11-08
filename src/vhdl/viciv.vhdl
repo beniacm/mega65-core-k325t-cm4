@@ -1203,12 +1203,17 @@ architecture Behavioral of viciv is
   --   * the raster buffer is double buffered as with NORRDEL = 0: the painting that starts in
   --     line N is shown in line N + 2;
   --   * the display side's text-area mask (chargen_active forced off above / below the text)
-  --     is the fetch side's mask of the line before (rl_mask: captured at the line start,
-  --     taken over at x = 0), i.e. the original mask of that line.
+  --     is the fetch side's mask of the line before (rl_mask: sampled at x = 0 at the end of
+  --     that line), i.e. the original mask of the line shown.
   -- Latched at the top of each frame (switching never happens inside a frame).
-  signal rl_shift       : std_logic := '0';
+  -- With DBLRR ($D051 bit 6: a line start every other line, two lines per painting) the same
+  -- by two lines (rl_shift2): fetch side at displayy + 2, double buffered (the painting that
+  -- starts in line N, N even, is shown in lines N + 3 and N + 4 instead of N + 1 and N + 2),
+  -- the mask two lines late.  Each painting then has its two lines and is shown complete.
+  signal rl_shift, rl_shift2 : std_logic := '0';
   signal displayy_p1    : unsigned(11 downto 0) := to_unsigned(1,12);   -- always displayy + 1
-  signal rl_mask_next, rl_mask : std_logic := '1';
+  signal displayy_p2    : unsigned(11 downto 0) := to_unsigned(2,12);   -- always displayy + 2
+  signal rl_mask1, rl_mask : std_logic := '1';
   -- list mode diagnostic counters (indices: soft_rtc.vhdl header, docs/rrb_list_mode.md)
   constant DG_FRAMES     : integer := 0;   -- exp_copy_start pulses
   constant DG_COPY_DONE  : integer := 1;   -- falling edges of exp_copying
@@ -3442,7 +3447,13 @@ begin
   begin
     if rising_edge(pixelclock) and all_pause='0' then
       -- K325T list mode lead (rl_shift, see the signal): the row schedule runs one line ahead
-      if rl_shift = '1' then yf := displayy_p1; else yf := displayy; end if;
+      if rl_shift = '1' then
+        yf := displayy_p1;
+      elsif rl_shift2 = '1' then
+        yf := displayy_p2;
+      else
+        yf := displayy;
+      end if;
 
       report "ycounter = $" & to_hstring(ycounter) & ", ycounter_driver = $" & to_hstring(ycounter_driver);
       ycounter <= ycounter_driver;
@@ -3615,7 +3626,14 @@ begin
         -- (this has to happen on the following raster, because we determine
         -- end of screen when we pre-compute the next row address)
         if last_external_frame_x_zero_latched = '0' then
-          rl_mask <= rl_mask_next;                -- K325T list mode lead (see rl_shift)
+          -- K325T list mode lead (see rl_shift): the fetch side's mask of the line ending
+          -- now (rl_shift) or of the line before (rl_shift2) masks the line starting now
+          rl_mask1 <= before_y_chargen_start and not justbefore_y_chargen_start;
+          if rl_shift2 = '1' then
+            rl_mask <= rl_mask1;
+          else
+            rl_mask <= before_y_chargen_start and not justbefore_y_chargen_start;
+          end if;
           if stop_chargen_raster_counter /= 0 then
             stop_chargen_raster_counter <= stop_chargen_raster_counter - 1;
           end if;
@@ -3683,6 +3701,7 @@ begin
           displaycolumn0 <= '1';
           displayy <= displayy + 1;
           displayy_p1 <= displayy_p1 + 1;               -- K325T list mode lead
+          displayy_p2 <= displayy_p2 + 1;
           if displayy(4)='1' then
             displayline0 <= '0';
           end if;
@@ -3762,9 +3781,11 @@ begin
 
         displayy <= (others => '0');
         displayy_p1 <= to_unsigned(1,12);               -- K325T list mode lead
+        displayy_p2 <= to_unsigned(2,12);
         -- K325T list mode lead: on or off for the whole frame (NORRDEL = 0 already double
         -- buffers; DBLRR fetches every other line only: both keep their own timing)
         rl_shift <= (rl_en_s(1) or rv2_s(1)) and no_raster_buffer_delay and not raster_buffer_double_line;
+        rl_shift2 <= (rl_en_s(1) or rv2_s(1)) and no_raster_buffer_delay and raster_buffer_double_line;
         displayline0 <= '1';
         indisplay := '0';
         report "clearing indisplay because xcounter=0" severity note;
@@ -3866,7 +3887,7 @@ begin
         raster_buffer_write_address(9 downto 0) <= (others => '1');
         -- Make sure we read and write to opposite halves of the raster buffer
         -- (K325T list mode lead: double buffered as with NORRDEL = 0)
-        raster_buffer_write_address(10) <= raster_buffer_half_toggle xor (no_raster_buffer_delay and not rl_shift);
+        raster_buffer_write_address(10) <= raster_buffer_half_toggle xor (no_raster_buffer_delay and not rl_shift and not rl_shift2);
         raster_buffer_half_toggle <= not raster_buffer_half_toggle;
         if list_saved_max > raster_buffer_max_write_address then      -- K325T list mode
           raster_buffer_max_write_address_hold <= list_saved_max;
@@ -3874,9 +3895,6 @@ begin
           raster_buffer_max_write_address_hold <= raster_buffer_max_write_address;
         end if;
         report "setting raster_buffer_max_write_address_hold to $" & to_hstring(raster_buffer_max_write_address);
-
-        -- K325T list mode lead: this line's fetch side mask, shown in the next line
-        rl_mask_next <= before_y_chargen_start and not justbefore_y_chargen_start;
 
         -- Reset glyph Y offset each raster line
         glyph_y_offset <= 0;
@@ -4124,7 +4142,7 @@ begin
         if chargen_y_sub /= 0 then
           report "LEGACY: Reseting chargen_y_sub";
         end if;
-        if rl_shift = '0' then                    -- K325T list mode lead: rl_mask below
+        if rl_shift = '0' and rl_shift2 = '0' then  -- K325T list mode lead: rl_mask below
           chargen_active <= '0';
           chargen_active_soon <= '0';
         end if;
@@ -4136,7 +4154,7 @@ begin
       end if;
       -- K325T list mode lead: the text-area mask of the line shown now is the fetch side's mask
       -- of the line before (which, one line ahead, is the original mask of this line)
-      if rl_shift = '1' and rl_mask = '1' then
+      if (rl_shift = '1' or rl_shift2 = '1') and rl_mask = '1' then
         chargen_active <= '0';
         chargen_active_soon <= '0';
       end if;
