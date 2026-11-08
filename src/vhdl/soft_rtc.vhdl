@@ -13,7 +13,9 @@
 --   bit 2 = 64 KB colour RAM (VIC-IV, via xctl_out), bit 4 = fast RRB (VIC-IV paints
 --   2 pixels per cycle), bit 5 = RRB list mode (LIST token $FFFC in CHR16 rows, see the lab
 --   repo's docs/rrb_list_mode.md), bit 6 = RRB list mode v2 (global object table, below);
---   bit 3 is unused here (24 extra sprites on branch k325t-extra-sprites)
+--   bit 7 = fast token path (VIC-IV, with bit 4: CHR16 text tokens pipelined, full-colour
+--   glyph rows as two 32-bit chip RAM reads); bit 3 is unused here (24 extra sprites on
+--   branch k325t-extra-sprites)
 -- $FFD71F4-$FFD71F7: raster DMA list address (28 bits, little endian)
 -- $FFD71F8-$FFD71FA: list mode v2 object table address in chip RAM (20 bits, little endian)
 -- $FFD71FB: number of objects (0..255, 16 bytes each)
@@ -84,7 +86,7 @@ architecture rtl of soft_rtc is
   signal dow            : unsigned(7 downto 0) := x"00";
   signal tick_cnt       : integer range 0 to clock_frequency - 1 := 0;
   signal xctl           : unsigned(7 downto 0) := x"00";       -- $FFD71F0
-  constant XCTL_BITS    : unsigned(7 downto 0) := x"77";       -- implemented bits (bit 3: see branch k325t-extra-sprites)
+  constant XCTL_BITS    : unsigned(7 downto 0) := x"F7";       -- implemented bits (bit 3: see branch k325t-extra-sprites)
   type rdl_t is array (0 to 3) of unsigned(7 downto 0);
   signal rdma_list      : rdl_t := (others => x"00");          -- $FFD71F4-7
   signal obj_tab        : rdl_t := (others => x"00");          -- $FFD71F8-B (B: count)

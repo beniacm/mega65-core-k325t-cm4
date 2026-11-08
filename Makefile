@@ -1177,10 +1177,10 @@ $(VHDLSRCDIR)/shadowram-attic.vhdl:	$(TOOLDIR)/mempacker/mempacker_new $(SDCARD_
 	$(TOOLDIR)/mempacker/mempacker_new -n shadowram -s 393215 -f $(VHDLSRCDIR)/shadowram-attic.vhdl $(SDCARD_DIR)/BANNER.M65@57D00 $(SDCARD_DIR)/FREEZER.M65@12000 $(SRCDIR)/open-roms/bin/mega65.rom@20000 $(SDCARD_DIR)/ONBOARD.M65@40000 $(MFUTILDIR)/mf_screens.bin@`cat $(MFUTILDIR)/mf_screens.adr` $(MFUTILDIR)/megaflash-attic.prg@50000
 
 # QMTech K325T: 1 MB chip RAM.  chipram_k325t.vhdl (entity shadowram) wraps the generated,
-# pre-loaded 384 KB (renamed shadowram_lo) and adds 640 KB of plain block RAM.
-$(VHDLSRCDIR)/shadowram-k325t-lo.vhdl:	$(VHDLSRCDIR)/shadowram-no-attic.vhdl
-	sed -e 's/^entity shadowram is/entity shadowram_lo is/' -e 's/^end shadowram;/end shadowram_lo;/' \
-	    -e 's/^architecture Behavioral of shadowram is/architecture Behavioral of shadowram_lo is/' $< > $@
+# pre-loaded 384 KB (shadowram_lo, split into four byte lanes for the VIC-IV's 32-bit read) and
+# adds 640 KB of plain block RAM.
+$(VHDLSRCDIR)/shadowram-k325t-lo.vhdl:	$(VHDLSRCDIR)/shadowram-no-attic.vhdl $(SRCDIR)/tools/k325t_chipram_lanes.py
+	python3 $(SRCDIR)/tools/k325t_chipram_lanes.py $< $@
 
 $(VHDLSRCDIR)/shadowram-cpusim.vhdl:	$(TOOLDIR)/mempacker/mempacker_new $(UTILDIR)/cpusim.prg
 	mkdir -p $(SDCARD_DIR)

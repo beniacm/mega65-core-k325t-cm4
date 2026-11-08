@@ -210,6 +210,8 @@ entity gs4510 is
     chipram_clk : IN std_logic;
     chipram_address : IN unsigned(19 DOWNTO 0) := to_unsigned(0,20);
     chipram_dataout : OUT unsigned(7 DOWNTO 0);
+    -- K325T (chipram_1mb): the aligned 32-bit word at chipram_address(19:2) (VIC-IV fast path)
+    chipram_dataout32 : OUT unsigned(31 DOWNTO 0) := (others => '0');
 
     cpu_leds : out std_logic_vector(3 downto 0);
 
@@ -1670,6 +1672,7 @@ begin
       );
   end generate;
 
+  shadowram_std: if chipram_1mb /= '1' generate
   shadowram0 : entity work.shadowram port map (
     clkA      => clock,
     addressa  => shadow_address_next,
@@ -1682,6 +1685,23 @@ begin
     addressb  => chipram_address,
     dob       => chipram_dataout
     );
+  end generate;
+  -- QMTech K325T: chipram_k325t.vhdl, with the VIC-IV's 32-bit word read
+  shadowram_k325t: if chipram_1mb = '1' generate
+  shadowram0 : entity work.shadowram port map (
+    clkA      => clock,
+    addressa  => shadow_address_next,
+    wea       => shadow_write_next,
+    dia       => memory_access_wdata_next,
+    no_writes => shadow_no_write_count,
+    writes    => shadow_write_count,
+    doa       => shadow_rdata,
+    clkB      => chipram_clk,
+    addressb  => chipram_address,
+    dob       => chipram_dataout,
+    dob32     => chipram_dataout32
+    );
+  end generate;
 
   zpcache0: entity work.ram36x1k port map (
     clkl => clock,

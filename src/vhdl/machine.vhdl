@@ -625,6 +625,7 @@ architecture Behavioral of machine is
   --signal chipram_we : STD_LOGIC;
   signal chipram_address : unsigned(19 DOWNTO 0);
   signal chipram_data : unsigned(7 DOWNTO 0);
+  signal chipram_data32 : unsigned(31 DOWNTO 0);   -- K325T: VIC-IV 32-bit word read
 
   signal rom_at_e000 : std_logic := '0';
   signal rom_at_c000 : std_logic := '0';
@@ -1280,6 +1281,7 @@ begin
       chipram_clk => pixelclock,
       chipram_address => chipram_address,
       chipram_dataout => chipram_data,
+      chipram_dataout32 => chipram_data32,
 
       cpu_leds => cpu_leds,
 
@@ -1385,6 +1387,7 @@ begin
     port map (
       colour_ram_64k_en => xctl(2),
       fast_rrb_en => xctl(4),
+      fast_token_en => xctl(7),
       rrb_list_en => xctl(5),
       rrb_v2_en => xctl(6),
       obj_tab_addr => xobj(19 downto 0),
@@ -1476,6 +1479,7 @@ begin
       --chipram_we => chipram_we,
       chipram_address => chipram_address,
       chipram_datain => chipram_data,
+      chipram_datain32 => chipram_data32,
       colour_ram_fastio_rdata => colour_ram_fastio_rdata,
       colour_ram_cs => colour_ram_cs,
       charrom_cs => charrom_cs,

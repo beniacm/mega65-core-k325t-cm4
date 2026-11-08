@@ -179,6 +179,8 @@ entity viciv is
     --chipram_we : IN STD_LOGIC;
     chipram_address : OUT unsigned(19 DOWNTO 0);
     chipram_datain : IN unsigned(7 DOWNTO 0);
+    -- K325T: the aligned 32-bit word at chipram_address(19:2), one clock (chipram_k325t dob32)
+    chipram_datain32 : IN unsigned(31 DOWNTO 0) := (others => '0');
 
     ---------------------------------------------------------------------------
     -- Direct interface to HyperRAM for fetching 256 colour glyph data etc
@@ -201,6 +203,7 @@ entity viciv is
     colour_ram_64k_en : in std_logic := '0';   -- XCTL bit 2 (K325T)
     fast_rrb_en : in std_logic := '0';        -- XCTL bit 4: paint 2 pixels per cycle (K325T)
     rrb_list_en : in std_logic := '0';        -- XCTL bit 5: RRB list mode (K325T, upstream #747)
+    fast_token_en : in std_logic := '0';      -- XCTL bit 7 (with bit 4): fast token path (K325T)
     rrb_v2_en : in std_logic := '0';          -- XCTL bit 6: list mode v2, global object table
     obj_tab_addr : in unsigned(19 downto 0) := (others => '0');   -- $FFD71F8-A
     obj_count : in unsigned(7 downto 0) := (others => '0');       -- $FFD71FB
@@ -491,6 +494,8 @@ architecture Behavioral of viciv is
                            PaintMemWait2,
                            PaintMemWait3,
                            PaintDispatch,
+                           TurboWait,          -- K325T fast token path: wait for the decoder
+                           TurboFetch32,       -- K325T fast token path: full-colour row assembled
                            EndOfChargen,
                            SpritePointerFetch,
                            SpritePointerFetch2,
@@ -1211,6 +1216,36 @@ architecture Behavioral of viciv is
   -- starts in line N, N even, is shown in lines N + 3 and N + 4 instead of N + 1 and N + 2),
   -- the mask two lines late.  Each painting then has its two lines and is shown complete.
   signal rl_shift, rl_shift2 : std_logic := '0';
+
+  -- K325T fast token path (XCTL bit 7 with bit 4; docs/rrb_list_mode.md "Fast token path"):
+  -- CHR16 text lines only.  A decoder (fp_dec) reads token k+1's screen and colour bytes and
+  -- computes its glyph address into the n_* registers (the work of FetchNextCharacter ..
+  -- FetchTextCellColourAndSource) while token k is fetched and dispatched; at k's dispatch the
+  -- n_* registers become the glyph_* registers (fp_take) and k+1 goes straight to
+  -- PaintMemWait.  Full-colour rows come as two 32-bit words (chipram_datain32; TurboFetch32
+  -- assembles the 8 bytes and does PaintMemWait3's work), and the painter takes the next
+  -- full-colour or mono glyph in its last pixel cycle (no setup/idle cycles in between).  A
+  -- token decoded behind a GOTOX that is not dispatched yet waits (fp_goto_pend): the GOTOX
+  -- changes the draw mask and Y offset the decoder uses.
+  signal fp_s           : std_logic_vector(1 downto 0) := "00";
+  signal fp_line        : std_logic := '0';
+  type fp_dec_t is (DIdle, D0, D1, D2, D3, DFull);
+  signal fp_dec         : fp_dec_t := DIdle;
+  signal fp_goto_pend   : std_logic := '0';
+  signal fcm_w0         : unsigned(31 downto 0) := (others => '0');
+  signal n_glyph_number : unsigned(12 downto 0) := (others => '0');
+  signal n_bg_select    : unsigned(1 downto 0) := "00";
+  signal n_flip_h, n_flip_v, n_alpha, n_goto, n_4bit, n_full_colour : std_logic := '0';
+  signal n_width_deduct : unsigned(3 downto 0) := (others => '0');
+  signal n_is_ff, n_high_is_ff : std_logic := '0';
+  signal n_list_in_exp, n_list_line_end, n_short_line : std_logic := '0';
+  signal n_short_line_length : integer range 0 to 512 := 0;
+  signal n_draw_mask_blank, n_from_rom : std_logic := '0';
+  signal n_glyph_data_address : unsigned(19 downto 0) := (others => '0');
+  signal n_colour_drive : unsigned(7 downto 0) := x"00";
+  signal n_bold_drive, n_underline_drive, n_reverse_drive, n_visible_drive, n_blink_drive : std_logic := '0';
+  signal n_draw_mask_drive : unsigned(7 downto 0) := x"FF";
+  signal n_bold_and_reverse : std_logic := '0';
   signal displayy_p1    : unsigned(11 downto 0) := to_unsigned(1,12);   -- always displayy + 1
   signal displayy_p2    : unsigned(11 downto 0) := to_unsigned(2,12);   -- always displayy + 2
   signal rl_mask1, rl_mask : std_logic := '1';
@@ -1423,7 +1458,7 @@ begin
            | SpritePointerFetch2 | SpritePointerCompute1 | SpriteDataFetch | SpriteDataFetch2 =>
           rd := true;
         when PaintMemWait | PaintMemWait2 =>
-          rd := glyph_full_colour = '1';
+          rd := glyph_full_colour = '1' or fp_line = '1';   -- (fast token path: every glyph)
         when others =>
           rd := false;
       end case;
@@ -3444,8 +3479,55 @@ begin
     variable next_glyph_colour_temp : std_logic_vector(7 downto 0) := (others => '0');
     variable rb_v1, rb_v2 : unsigned(17 downto 0);    -- K325T fast RRB pixels
     variable yf : unsigned(11 downto 0);              -- K325T list mode: fetch side's displayy
+    -- K325T fast token path
+    variable fs_now, p_last, fast_ok, t_disp_fcm, t_disp_mono : boolean;
+    variable fds : fp_dec_t;
+    variable fb : unsigned(7 downto 0);
+    variable fw : unsigned(63 downto 0);
+    variable bgc : unsigned(7 downto 0);
+    -- the decoded token becomes the token in flight (what FetchNextCharacter ..
+    -- FetchTextCellColourAndSource would have left in the glyph_* registers)
+    procedure fp_take is
+    begin
+      glyph_number <= n_glyph_number; background_colour_select <= n_bg_select;
+      glyph_flip_horizontal <= n_flip_h; glyph_flip_vertical <= n_flip_v;
+      glyph_with_alpha <= n_alpha; glyph_width_deduct <= n_width_deduct;
+      glyph_goto <= n_goto; glyph_4bit <= n_4bit; glyph_full_colour <= n_full_colour;
+      if n_list_in_exp = '1' then list_in_exp <= '1'; end if;
+      if n_list_line_end = '1' then list_line_end <= '1'; end if;
+      if n_short_line = '1' then
+        short_line <= '1'; short_line_length <= n_short_line_length;
+      end if;
+      draw_mask_blank <= n_draw_mask_blank;
+      glyph_data_address <= n_glyph_data_address;
+      character_data_from_rom <= n_from_rom;
+      glyph_colour_drive <= n_colour_drive;
+      glyph_bold_drive <= n_bold_drive; glyph_underline_drive <= n_underline_drive;
+      glyph_reverse_drive <= n_reverse_drive; glyph_visible_drive <= n_visible_drive;
+      glyph_blink_drive <= n_blink_drive;
+      if n_goto = '1' then screenline_draw_mask_drive <= n_draw_mask_drive; end if;
+      glyph_bold_and_reverse <= n_bold_and_reverse;
+      fp_goto_pend <= n_goto;
+      fp_dec <= D0;                              -- the next token (fds below: D0 this cycle)
+      fds := D0;
+    end procedure;
   begin
     if rising_edge(pixelclock) and all_pause='0' then
+      -- K325T fast token path: this cycle's line start, and whether the painter is in the last
+      -- pixel cycle of its glyph (fast path only: then it can take the next glyph right away)
+      fs_now := is_fetch_start = '1' and last_was_fetch_start = '0';
+      t_disp_fcm := false; t_disp_mono := false;
+      fds := fp_dec;
+      fast_ok := rb_fast_s(1) = '1' and (raster_buffer_write_address(9 downto 0) <= 1020 or rrb_wraparound_allowed = '1');
+      case paint_fsm_state is
+        when PaintFullColourPixels | Paint4bitColourPixels =>
+          p_last := (fast_ok and paint_bits_remaining = 1) or (not fast_ok and paint_bits_remaining = 0)
+                    or (fast_ok and paint_bits_remaining = 0);
+        when PaintMonoBits =>
+          p_last := (fast_ok and paint_bits_remaining = 2) or (paint_bits_remaining <= 1);
+        when others =>
+          p_last := false;
+      end case;
       -- K325T list mode lead (rl_shift, see the signal): the row schedule runs one line ahead
       if rl_shift = '1' then
         yf := displayy_p1;
@@ -3895,6 +3977,9 @@ begin
           raster_buffer_max_write_address_hold <= raster_buffer_max_write_address;
         end if;
         report "setting raster_buffer_max_write_address_hold to $" & to_hstring(raster_buffer_max_write_address);
+
+        -- K325T fast token path: off until this line's FetchFirstCharacter
+        fp_line <= '0'; fp_dec <= DIdle; fp_goto_pend <= '0';
 
         -- Reset glyph Y offset each raster line
         glyph_y_offset <= 0;
@@ -4836,6 +4921,14 @@ begin
           else
             raster_fetch_state <= EndOfCharGen;
           end if;
+          -- K325T fast token path for CHR16 text lines: the decoder starts with token 0 (the
+          -- screen buffer read address is 0 from the next cycle on)
+          fp_line <= '0'; fp_dec <= DIdle; fp_goto_pend <= '0';
+          if fp_s(1) = '1' and rb_fast_s(1) = '1' and text_mode = '1' and sixteenbit_charset = '1'
+             and bitplane_mode = '0' and (glyphs_from_hyperram = '0' or not hyper_installed) then
+            fp_line <= '1'; fp_dec <= D0;
+            raster_fetch_state <= TurboWait;
+          end if;
         when FetchNextCharacter =>
           -- Fetch next character
           -- All we can expect here is that character_number is correctly set.
@@ -5271,6 +5364,66 @@ begin
           else
             raster_fetch_state <= PaintMemWait3;
           end if;
+          -- K325T fast token path: the first word of a full-colour row arrives now (requested in
+          -- PaintMemWait), the second next cycle; a GOTOX needs no glyph data
+          if fp_line = '1' then
+            fcm_w0 <= chipram_datain32;
+            if glyph_goto = '1' then
+              raster_fetch_state <= PaintMemWait3;
+            elsif glyph_full_colour = '1' then
+              raster_fetch_state <= TurboFetch32;
+            end if;
+          end if;
+        when TurboWait =>
+          -- K325T fast token path: the first token of the line (or one decoded late)
+          if fp_dec = DFull then
+            fp_take;
+            raster_fetch_state <= PaintMemWait;
+          end if;
+        when TurboFetch32 =>
+          -- K325T fast token path: the 8 bytes of a full-colour row (two words, byte n of a word
+          -- is address 4w + n) as PaintFullColourFetch would have assembled them, then
+          -- PaintMemWait3's work
+          for i in 0 to 7 loop
+            if glyph_flip_horizontal = '0' then
+              if i < 4 then fb := fcm_w0(8 * i + 7 downto 8 * i);
+              else fb := chipram_datain32(8 * (i - 4) + 7 downto 8 * (i - 4)); end if;
+            else
+              if i < 4 then fb := chipram_datain32(8 * (3 - i) + 7 downto 8 * (3 - i));
+              else fb := fcm_w0(8 * (7 - i) + 7 downto 8 * (7 - i)); end if;
+            end if;
+            if glyph_4bit = '1' and glyph_flip_horizontal = '1' then
+              fb := fb(3 downto 0) & fb(7 downto 4);    -- flip the nybl order
+            end if;
+            if glyph_visible = '0' or draw_mask_blank = '1' then
+              fw(8 * i + 7 downto 8 * i) := x"00";
+            else
+              fw(8 * i + 7 downto 8 * i) := fb;
+            end if;
+            if glyph_xor = '1' then
+              fw(8 * i + 7 downto 8 * i) := fb xor x"FF";
+            end if;
+            if glyph_underline = '1' then
+              fw(8 * i + 7 downto 8 * i) := x"FF";
+            end if;
+          end loop;
+          full_colour_data <= fw;
+          character_number <= character_number + 1;
+          if character_number(10 downto 0) = display_row_width_minus1 then
+            end_of_row_16 <= '1';
+          else
+            end_of_row_16 <= '0';
+          end if;
+          if character_number = '0'&display_row_width_minus1 then
+            end_of_row <= '1';
+          else
+            end_of_row <= '0';
+          end if;
+          if (end_of_row = '1' and row_list = '0') or (short_line='1') or (list_line_end = '1') then
+            raster_fetch_state <= EndOfChargen;
+          else
+            raster_fetch_state <= PaintDispatch;
+          end if;
         when PaintFullColourHyperRAMFetch =>
           -- Read data from dedicated hyperram interface (a bit like the VRAM
           -- that was originally planned for the Amiga Ranger chipset that was
@@ -5380,7 +5533,12 @@ begin
           -- Dispatch this card for painting.
 
           -- Hold from dispatching if painting the previous card is not yet finished.
-          if paint_ready='1' then
+          -- (K325T fast token path: a full-colour or plain mono glyph may go in the painter's
+          -- last pixel cycle; a GOTOX waits for the painter to be idle, as before)
+          if paint_ready='1'
+             or (fp_line = '1' and p_last and glyph_goto = '0'
+                 and (glyph_full_colour = '1'
+                      or (multicolour_mode = '0' and extended_background_mode = '0'))) then
             paint_from_charrom <= character_data_from_rom;
             report "character rom address set to $" & to_hstring(glyph_data_address(11 downto 0)) severity note;
             -- Tell painter whether to flip horizontally or not.
@@ -5543,8 +5701,26 @@ begin
             end if;
             -- Fetch next character
             raster_fetch_state <= FetchNextCharacter;
+            -- K325T fast token path: the next token is decoded already (or TurboWait waits for
+            -- it); the painter's state is set after the painter's own case (below)
+            if fp_line = '1' then
+              if glyph_goto = '1' then
+                fp_goto_pend <= '0';
+              elsif glyph_full_colour = '1' then
+                t_disp_fcm := true;
+              elsif paint_ready = '0' then
+                t_disp_mono := true;                 -- dispatched in the painter's last cycle
+              end if;
+              if fp_dec = DFull then
+                fp_take;
+                raster_fetch_state <= PaintMemWait;
+              else
+                raster_fetch_state <= TurboWait;
+              end if;
+            end if;
           end if;
         when EndOfChargen =>
+          fp_line <= '0';                         -- K325T fast token path: decoder off
 
           -- Idle the painter, and then start drawing VIC-II sprites
           if paint_ready='1' then
@@ -5805,6 +5981,171 @@ begin
         when others => null;
       end case;
 
+      -- K325T fast token path: the decoder (see fp_line).  The same work as FetchNextCharacter,
+      -- FetchCharHighByte, FetchTextCell and FetchTextCellColourAndSource for CHR16 text, into
+      -- the n_* registers, one token ahead; not in a line-start cycle (the line start owns the
+      -- screen buffer and colour RAM addresses then).
+      if fp_line = '1' and not fs_now then
+        case fds is
+          when D0 =>
+            n_glyph_number(12 downto 8) <= "00000";
+            n_glyph_number(5 downto 0) <= screen_ram_buffer_dout(5 downto 0);
+            if extended_background_mode='1' then
+              n_bg_select <= screen_ram_buffer_dout(7 downto 6);
+            else
+              n_bg_select <= "00";
+              n_glyph_number(7 downto 6) <= screen_ram_buffer_dout(7 downto 6);
+            end if;
+            screen_ram_buffer_read_address <= screen_ram_buffer_read_address + 1;
+            n_flip_h <= '0'; n_flip_v <= '0'; n_alpha <= '0'; n_goto <= '0'; n_4bit <= '0';
+            n_width_deduct <= (others => '0');
+            if screen_ram_buffer_dout = x"ff" then n_is_ff <= '1'; else n_is_ff <= '0'; end if;
+            n_high_is_ff <= '0';
+            n_list_in_exp <= '0'; n_list_line_end <= '0'; n_short_line <= '0';
+            fp_dec <= D1;
+          when D1 =>
+            colourramaddress <= colourramaddress + 1;
+            if screen_ram_buffer_dout(4 downto 0) = "00000" then
+              n_full_colour <= fullcolour_8bitchars;
+            else
+              n_full_colour <= fullcolour_extendedchars;
+            end if;
+            if reg_char_y16='1' and charrow_repeated='1' and ((fullcolour_extendedchars='1' and screen_ram_buffer_dout(4 downto 0) /= "00000") or fullcolour_8bitchars='1') and colourramdata(4)='0' then
+              n_glyph_number(7 downto 0) <= n_glyph_number(7 downto 0) + 1;
+              if n_glyph_number(7 downto 0) = x"ff" then
+                n_glyph_number(12 downto 8) <= screen_ram_buffer_dout(4 downto 0) + 1;
+              else
+                n_glyph_number(12 downto 8) <= screen_ram_buffer_dout(4 downto 0);
+              end if;
+            else
+              n_glyph_number(12 downto 8) <= screen_ram_buffer_dout(4 downto 0);
+            end if;
+            n_width_deduct(2 downto 0) <= screen_ram_buffer_dout(7 downto 5);
+            n_width_deduct(3) <= colourramdata(2);
+            if screen_ram_buffer_dout = x"ff" then n_high_is_ff <= '1'; end if;
+            n_flip_v <= colourramdata(7);
+            n_flip_h <= colourramdata(6);
+            n_alpha <= colourramdata(5);
+            n_goto <= colourramdata(4);
+            n_4bit <= colourramdata(3);
+            if colourramdata(3)='1' then n_full_colour <= '1'; end if;
+            screen_ram_buffer_read_address <= screen_ram_buffer_read_address + 1;
+            fp_dec <= D2;
+          when D2 =>
+            -- waits while a GOTOX before this token is not dispatched (draw mask, Y offset)
+            if fp_goto_pend = '0' then
+              if row_list = '1' and screen_ram_buffer_read_address > list_pos then
+                n_list_in_exp <= '1';
+              end if;
+              if n_is_ff = '1' and n_high_is_ff = '1' then
+                if row_list = '1' and screen_ram_buffer_read_address > list_pos then
+                  n_list_line_end <= '1';
+                  if row_short = '1' then
+                    n_short_line <= '1';
+                    n_short_line_length <= safe_to_integer(list_pos) + 2;
+                  end if;
+                else
+                  n_short_line <= '1';
+                  n_short_line_length <= safe_to_integer(screen_ram_buffer_read_address);
+                end if;
+              end if;
+              n_draw_mask_blank <= not screenline_draw_mask(to_integer(chargen_y_hold));
+              if n_full_colour = '1' then
+                n_glyph_data_address(19) <= '0';
+                if n_flip_v = '1' then
+                  if glyph_nve_y_offset = '1' then
+                    n_glyph_data_address(18 downto 3) <= (n_glyph_number(12 downto 0) & not chargen_y_hold) - glyph_y_offset;
+                  else
+                    n_glyph_data_address(18 downto 3) <= (n_glyph_number(12 downto 0) & not chargen_y_hold) + glyph_y_offset;
+                  end if;
+                else
+                  if glyph_nve_y_offset = '1' then
+                    n_glyph_data_address(18 downto 3) <= (n_glyph_number(12 downto 0) & chargen_y_hold) - glyph_y_offset;
+                  else
+                    n_glyph_data_address(18 downto 3) <= (n_glyph_number(12 downto 0) & chargen_y_hold) + glyph_y_offset;
+                  end if;
+                end if;
+                if n_flip_h = '1' then
+                  n_glyph_data_address(2 downto 0) <= "111";
+                else
+                  n_glyph_data_address(2 downto 0) <= "000";
+                end if;
+                n_from_rom <= '0';
+              else
+                if n_flip_v = '0' then
+                  n_glyph_data_address <= character_set_address(19 downto 0)
+                    + safe_to_integer(n_glyph_number)*8+safe_to_integer(chargen_y_hold);
+                else
+                  n_glyph_data_address <= character_set_address(19 downto 0)
+                    + safe_to_integer(n_glyph_number)*8+7-safe_to_integer(chargen_y_hold);
+                end if;
+                n_from_rom <= '1';
+              end if;
+              fp_dec <= D3;
+            end if;
+          when D3 =>
+            if n_from_rom = '1' then
+              if n_glyph_data_address(19 downto 12) = "0000"&x"1"
+                or n_glyph_data_address(19 downto 12) = "0000"&x"9" then
+                n_from_rom <= '1';
+              else
+                n_from_rom <= '0';
+              end if;
+            end if;
+            if n_full_colour='1' and viciii_extended_attributes='0' then
+              n_colour_drive <= colourramdata;
+            else
+              n_colour_drive(7 downto 4) <= "0000";
+              n_colour_drive(3 downto 0) <= colourramdata(3 downto 0);
+            end if;
+            n_bold_drive <= '0';
+            n_underline_drive <= '0';
+            n_reverse_drive <= '0';
+            n_visible_drive <= '1';
+            n_blink_drive <= '0';
+            if n_goto = '1' then
+              n_draw_mask_drive <= colourramdata;
+            end if;
+            n_bold_and_reverse <= colourramdata(5) and colourramdata(6);
+            if multicolour_mode='1' then
+              n_colour_drive(7 downto 4) <= colourramdata(7 downto 4);
+            else
+              if viciii_extended_attributes='1' then
+                if colourramdata(4)='1' then
+                  n_blink_drive <= '1';
+                  if colourramdata(5)='1' or colourramdata(6)='1' or colourramdata(7)='1' then
+                    if viciii_blink_phase='1' then
+                      n_reverse_drive <= colourramdata(5);
+                      n_bold_drive <= colourramdata(6);
+                      if bold_is_alt='0' then
+                        n_colour_drive(4) <= colourramdata(6);
+                      end if;
+                      if chargen_y_hold="111" then
+                        n_underline_drive <= colourramdata(7);
+                      end if;
+                    end if;
+                  else
+                    n_visible_drive <= viciii_blink_phase;
+                  end if;
+                else
+                  n_visible_drive <= '1';
+                  n_reverse_drive <= colourramdata(5);
+                  n_bold_drive <= colourramdata(6);
+                  if bold_is_alt='0' then
+                    n_colour_drive(4) <= colourramdata(6);
+                  end if;
+                  if chargen_y_hold="111" then
+                    n_underline_drive <= colourramdata(7);
+                  end if;
+                end if;
+              end if;
+            end if;
+            colourramaddress <= colourramaddress + 1;
+            fp_dec <= DFull;
+          when others => null;
+        end case;
+      end if;
+
       -- Force abort of existing RRB line render if we've run out of cycles.
       if raster_fetch_restart='1' and rrb_overtime_allowed='0' then        
         raster_fetch_state <= raster_fetch_state_init;
@@ -5837,6 +6178,7 @@ begin
       raster_buffer_write_data(17) <= paint_alternate_palette xor glyph_alternate_palette_invert;
 
       rb_fast_s <= rb_fast_s(0) & fast_rrb_en;   -- K325T fast RRB
+      fp_s <= fp_s(0) & fast_token_en;           -- K325T fast token path
       rb_double <= '0';
       raster_buffer_write2 <= '0';
       case paint_fsm_state is
@@ -6341,6 +6683,35 @@ begin
           paint_fsm_state <= Idle;
       end case;
 
+      -- K325T fast token path: a glyph dispatched this cycle (PaintDispatch) -- possibly in the
+      -- painter's last pixel cycle, so after the painter's own assignments.  Full colour / NCM:
+      -- PaintFullColour's set-up done here, straight to the pixels; mono: to PaintMono.
+      if t_disp_fcm then
+        paint_ready <= '0';
+        paint_full_colour_data <= full_colour_data;
+        paint_bits_remaining <= glyph_width - 1;
+        case background_colour_select is
+          when "01" => bgc := multi1_colour;
+          when "10" => bgc := multi2_colour;
+          when "11" => bgc := multi3_colour;
+          when others => bgc := screen_colour;
+        end case;
+        if glyph_reverse='1' and (glyph_bold='0' or bold_is_alt='1') and glyph_with_alpha='0' then
+          paint_background_with_any_reverse <= glyph_colour;
+          transparent_pixel_will_come_from_primary_palette <= '1';
+        else
+          paint_background_with_any_reverse <= bgc;
+          transparent_pixel_will_come_from_primary_palette <= '0';
+        end if;
+        if glyph_4bit = '1' then
+          paint_fsm_state <= Paint4bitColourPixels;
+        else
+          paint_fsm_state <= PaintFullColourPixels;
+        end if;
+      elsif t_disp_mono then
+        paint_fsm_state <= PaintMono;
+      end if;
+
       if raster_fetch_state /= Idle or paint_fsm_state /= Idle then
         report "raster_fetch_state=" & vic_chargen_fsm'image(raster_fetch_state) & ", "
           & "paint_fsm_state=" & vic_paint_fsm'image(paint_fsm_state)
@@ -6447,7 +6818,7 @@ begin
   -- value changes so that it can be driven into the block ram and sampled at the next clock cycle, thus providing the
   -- expected data on the next clock as well.
   process(raster_fetch_state,this_ramaccess_is_screen_row_fetch,glyph_data_address,sprite_pointer_address,sprite_data_address,
-          ramaddress,this_screen_row_fetch_address,glyph_full_colour,exp_mreq,exp_maddr)
+          ramaddress,this_screen_row_fetch_address,glyph_full_colour,exp_mreq,exp_maddr,fp_line,glyph_goto)
   begin
     next_ramaddress <= ramaddress;
 
@@ -6470,10 +6841,21 @@ begin
           report "setting ramaddress to $" & to_hstring(glyph_data_address) & " for full-colour glyph drawing";
           next_ramaddress <= glyph_data_address;
         end if;
+        -- K325T fast token path: the glyph's address (FetchTextCellColourAndSource put it out
+        -- before); a full-colour row as its first 32-bit word
+        if fp_line = '1' then
+          next_ramaddress <= glyph_data_address;
+          if glyph_full_colour = '1' then
+            next_ramaddress(2 downto 0) <= "000";
+          end if;
+        end if;
       when PaintMemWait2 =>
         if glyph_full_colour = '1' then
           report "LEGACY: setting ramaddress to $" & to_hstring(glyph_data_address) & " for full-colour glyph drawing";
           next_ramaddress <= glyph_data_address;
+          if fp_line = '1' then                 -- K325T fast token path: the second word
+            next_ramaddress(2 downto 0) <= "100";
+          end if;
         end if;
       when PaintFullColourFetch =>
         report "setting ramaddress to $" & to_hstring(glyph_data_address) & " for full-colour glyph drawing";
