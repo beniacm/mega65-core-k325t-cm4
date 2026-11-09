@@ -409,16 +409,19 @@ entity iomapper is
 
     colourram_at_dc00 : in std_logic;
     xctl_out : out unsigned(7 downto 0) := (others => '0');  -- K325T extension control
-    xobj_out : out unsigned(28 downto 0) := (others => '0');  -- K325T list mode v2 registers
+    xobj_out : out unsigned(30 downto 0) := (others => '0');  -- K325T list mode v3 registers
+    col_budget_out : out unsigned(15 downto 0) := (others => '0');  -- collision pair budget
     diag_sel_out : out unsigned(4 downto 0) := (others => '0');  -- K325T list mode diagnostics
     diag_clr_out : out std_logic := '0';
     diag_val_in : in unsigned(15 downto 0) := (others => '0');
     -- K325T list mode v2 collisions (VIC-IV pixel clock; soft_rtc copies them on col_toggle)
-    col_bits_in : in std_logic_vector(255 downto 0) := (others => '0');
-    col_count_in : in unsigned(7 downto 0) := (others => '0');
+    col_bits_in : in std_logic_vector(1023 downto 0) := (others => '0');
+    col_count_in : in unsigned(9 downto 0) := (others => '0');
+    col_trunc_in : in std_logic := '0';
+    bk_full_in : in std_logic := '0';
     col_toggle_in : in std_logic := '0';
-    col_pidx_out : out unsigned(7 downto 0) := (others => '0');
-    col_pdata_in : in unsigned(7 downto 0) := (others => '1')
+    col_pidx_out : out unsigned(9 downto 0) := (others => '0');
+    col_pdata_in : in unsigned(9 downto 0) := (others => '1')
 
     );
 end iomapper;
@@ -1395,11 +1398,12 @@ begin
         fastio_wdata => unsigned(data_i),
         std_logic_vector(fastio_rdata) => data_o,
         xctl_out => xctl_out,
-        xobj_out => xobj_out,
+        xobj_out => xobj_out, col_budget_out => col_budget_out,
         diag_sel_out => diag_sel_out,
         diag_clr_out => diag_clr_out,
         diag_val_in => diag_val_in,
         col_bits_in => col_bits_in, col_count_in => col_count_in, col_toggle_in => col_toggle_in,
+        col_trunc_in => col_trunc_in, bk_full_in => bk_full_in,
         col_pidx_out => col_pidx_out, col_pdata_in => col_pdata_in,
         irq_n => rtc_irq);
   end generate;
@@ -2195,7 +2199,8 @@ begin
 
       if target = qmtechk325t then
         -- @IO:GS $FFD7110-$FFD7116 RTC (soft_rtc on the QMTech K325T: set by the Rockchip)
-        if address(19 downto 8) = x"D71" then
+        -- (soft_rtc also holds the K325T registers: $FFD71xx and the list mode v3 page $FFD72xx)
+        if address(19 downto 8) = x"D71" or address(19 downto 8) = x"D72" then
           i2cperipherals_cs <= '1';
         end if;
       end if;

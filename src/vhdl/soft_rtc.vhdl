@@ -17,11 +17,14 @@
 --   glyph rows as two 32-bit chip RAM reads); bit 3 = unpainted pixels show as background (VIC-IV:
 --   no stale raster buffer pixels, lines run to the full text width)
 -- $FFD71F4-$FFD71F7: raster DMA list address (28 bits, little endian)
--- $FFD71F8-$FFD71FA: list mode v2 object table address in chip RAM (20 bits, little endian)
--- $FFD71FB: number of objects (0..255, 16 bytes each)
+-- $FFD71F8-$FFD71FA: list mode v3 object table address in chip RAM (20 bits, little endian)
+-- $FFD71FB: number of objects, low byte (a write also clears the high bits: 0..255 for old
+--   programs; 32 bytes per entry, the VIC-IV reads bytes 0..15)
 -- $FFD71FC: bit 0 = HOLD: the VIC-IV keeps its last snapshot of the table (no copy per frame)
 -- $FFD71FD: read only, K325T extension level: 1 = everything up to XCTL bit 3, 2 = + the
---   collides-with mask (object +15) and the list mode expansion overlapping the painting
+--   collides-with mask (object +15) and the list mode expansion overlapping the painting,
+--   3 = list mode v3 (32-byte entries, 1023 objects, per-row buckets, circle test, pair
+--   budget, the $FFD7200 page)
 -- (gs4510 snoops these writes and acts on them; the copies here are for reading back)
 -- $FFD71E0-$FFD71E3: RRB list mode diagnostic counters (16-bit, in the VIC-IV, pixel clock):
 --   $FFD71E0 write: select counter 0..31, read: the selected index
@@ -55,13 +58,25 @@
 --   25 max cycles line start -> end of the line's painting (EndOfChargen; a painting cut off
 --      by the next line start counts the cycles it had)
 --   26 max cycles line start -> first GOTOX of a list row's expanded part (its first object)
--- $FFD71A0-$FFD71C3: list mode v2 collisions (docs/rrb_list_mode.md "Collisions"), the result
---   of the VIC-IV's last pass over the frame's snapshot:
+-- $FFD7200-$FFD728C: list mode v3 collisions and table (docs/rrb_list_mode.md "v3 table"):
+--   $FFD7200-$FFD727F read: collided objects 0..1023, byte n bit b = object 8n + b
+--   $FFD7280 status / control: as $FFD71C0, + read bit 2 = the last pass was truncated by the
+--     pair budget, bit 3 = the last bucket build dropped entries (more than 2048)
+--   $FFD7282-$FFD7283 r/w: object number (10 bits; shared with $FFD71C1)
+--   $FFD7284-$FFD7285 read: its first partner (lowest number, $3FF: none)
+--   $FFD7286-$FFD7287 read: number of collided objects (0..1023)
+--   $FFD7288-$FFD7289 r/w: pair budget per pass (0 = no limit)
+--   $FFD728A-$FFD728B r/w: number of objects (10 bits; $FFD728A = $FFD71FB without clearing
+--     the high bits)
+--   $FFD728C read: K325T extension level (= $FFD71FD)
+-- $FFD71A0-$FFD71C3: collisions of objects 0..255 (docs/rrb_list_mode.md "Collisions"), the
+--   result of the VIC-IV's last pass over the frame's snapshot:
 --   $FFD71A0-$FFD71BF read: collided objects, byte n bit b = object 8n + b
 --   $FFD71C0 read: bit 0 a pass found a collision (latched), bit 1 IRQ enable, bit 7 IRQ
 --     pending (set with bit 0); write: bit 1 = IRQ enable, bit 0 = 1 clears bits 0 and 7
---   $FFD71C1 r/w: object number;  $FFD71C2 read: its first partner (lowest number, $FF none)
---   $FFD71C3 read: number of collided objects
+--   $FFD71C1 r/w: object number (a write clears the high bits);  $FFD71C2 read: its first
+--     partner (lowest number; $FF: none or above 255)
+--   $FFD71C3 read: number of collided objects (255 if more)
 --   IRQ: active while bit 7 and bit 1 are set (iomapper's IRQ, like the other peripherals)
 -- All other addresses of the $FFD71xx page read 0.  Until the first write it reads an
 -- invalid date (day 0), which the ROM reports as "no RTC".
@@ -82,17 +97,20 @@ entity soft_rtc is
     fastio_wdata : in  unsigned(7 downto 0);
     fastio_rdata : out unsigned(7 downto 0);
     xctl_out     : out unsigned(7 downto 0);
-    xobj_out     : out unsigned(28 downto 0);   -- list mode v2 (VIC-IV): hold & count & table
+    xobj_out     : out unsigned(30 downto 0);   -- list mode v3 (VIC-IV): hold & count & table
+    col_budget_out : out unsigned(15 downto 0);  -- pair budget per collision pass
     diag_sel_out : out unsigned(4 downto 0);    -- list mode diagnostic counters (VIC-IV)
     diag_clr_out : out std_logic;               -- toggles on a write to $FFD71E3
     diag_val_in  : in  unsigned(15 downto 0) := (others => '0');  -- pixel clock domain
     -- list mode v2 collisions (VIC-IV, pixel clock): the last pass's result, stable between
     -- two toggles of col_toggle_in; copied into this clock domain on each toggle
-    col_bits_in  : in  std_logic_vector(255 downto 0) := (others => '0');
-    col_count_in : in  unsigned(7 downto 0) := (others => '0');
+    col_bits_in  : in  std_logic_vector(1023 downto 0) := (others => '0');
+    col_count_in : in  unsigned(9 downto 0) := (others => '0');
+    col_trunc_in : in  std_logic := '0';         -- (with col_bits_in)
+    bk_full_in   : in  std_logic := '0';         -- (quasi static)
     col_toggle_in : in std_logic := '0';
-    col_pidx_out : out unsigned(7 downto 0);
-    col_pdata_in : in  unsigned(7 downto 0) := (others => '1');
+    col_pidx_out : out unsigned(9 downto 0);
+    col_pdata_in : in  unsigned(9 downto 0) := (others => '1');
     irq_n        : out std_logic := '1'          -- collision IRQ (active low, to the CPU)
   );
 end entity;
@@ -107,20 +125,25 @@ architecture rtl of soft_rtc is
   constant XCTL_BITS    : unsigned(7 downto 0) := x"FF";       -- implemented bits
   -- $FFD71FD: K325T extension level (1 = XCTL bits 0-7 incl. bit 3; 2 = + collides-with mask
   -- (+15) and the list mode expansion overlapping the painting, 2 KB list rows)
-  constant K325T_LEVEL  : unsigned(7 downto 0) := x"02";
+  -- 3 = list mode v3 (32-byte entries, 1023 objects, buckets, circles, budget, $FFD72xx)
+  constant K325T_LEVEL  : unsigned(7 downto 0) := x"03";
   type rdl_t is array (0 to 3) of unsigned(7 downto 0);
   signal rdma_list      : rdl_t := (others => x"00");          -- $FFD71F4-7
   signal obj_tab        : rdl_t := (others => x"00");          -- $FFD71F8-B (B: count)
   signal obj_hold       : std_logic := '0';                    -- $FFD71FC bit 0
+  signal obj_cnt_hi     : unsigned(1 downto 0) := "00";        -- $FFD728B bits 1..0
+  signal col_budget     : unsigned(15 downto 0) := (others => '0');  -- $FFD7288-9
+  signal cs71, cs72     : std_logic;                           -- the $FFD71xx / $FFD72xx page
   signal diag_sel       : unsigned(4 downto 0) := (others => '0');   -- $FFD71E0
   signal diag_clr_t     : std_logic := '0';                    -- toggled by $FFD71E3 writes
   signal diag_v1, diag_v2 : unsigned(15 downto 0) := (others => '0');   -- diag_val_in, synchronised
   -- collisions ($FFD71A0-$FFD71C3)
   signal col_ts         : std_logic_vector(2 downto 0) := "000";
-  signal col_cbits      : std_logic_vector(255 downto 0) := (others => '0');
-  signal col_ccount     : unsigned(7 downto 0) := (others => '0');
-  signal col_any, col_pend, col_irqen : std_logic := '0';
-  signal col_pidx       : unsigned(7 downto 0) := (others => '0');
+  signal col_cbits      : std_logic_vector(1023 downto 0) := (others => '0');
+  signal col_ccount     : unsigned(9 downto 0) := (others => '0');
+  signal col_any, col_pend, col_irqen, col_ctr : std_logic := '0';
+  signal bk_fs          : std_logic_vector(1 downto 0) := "00";
+  signal col_pidx       : unsigned(9 downto 0) := (others => '0');
 
   -- BCD + 1 (no range check)
   function bcd_inc(v : unsigned(7 downto 0)) return unsigned is
@@ -151,18 +174,48 @@ architecture rtl of soft_rtc is
   end function;
 begin
   xctl_out <= xctl;
-  xobj_out <= obj_hold & obj_tab(3) & obj_tab(2)(3 downto 0) & obj_tab(1) & obj_tab(0);
+  xobj_out <= obj_hold & obj_cnt_hi & obj_tab(3) & obj_tab(2)(3 downto 0) & obj_tab(1) & obj_tab(0);
+  col_budget_out <= col_budget;
+  cs71 <= cs when fastio_addr(11 downto 8) = x"1" else '0';
+  cs72 <= cs when fastio_addr(11 downto 8) = x"2" else '0';
   diag_sel_out <= diag_sel;
   diag_clr_out <= diag_clr_t;
   col_pidx_out <= col_pidx;
   irq_n <= not (col_pend and col_irqen);
 
   -- reads: combinational onto the shared fastio bus, 'Z' when not selected
-  process (cs, fastio_read, fastio_addr, sec, min, hour, day, month, year, dow, xctl, rdma_list, obj_tab, obj_hold, diag_sel, diag_v2,
-           col_cbits, col_ccount, col_any, col_pend, col_irqen, col_pidx, col_pdata_in) is
+  process (cs71, cs72, fastio_read, fastio_addr, sec, min, hour, day, month, year, dow, xctl, rdma_list, obj_tab, obj_hold, diag_sel, diag_v2,
+           col_cbits, col_ccount, col_any, col_pend, col_irqen, col_pidx, col_pdata_in, col_ctr, bk_fs,
+           col_budget, obj_cnt_hi) is
     variable n : integer range 0 to 31;
+    variable m : integer range 0 to 127;
   begin
-    if cs = '1' and fastio_read = '1' then
+    if cs72 = '1' and fastio_read = '1' then
+      m := to_integer(fastio_addr(6 downto 0));
+      if fastio_addr(7) = '0' then
+        fastio_rdata <= unsigned(col_cbits(8 * m + 7 downto 8 * m));
+      else
+        case fastio_addr(7 downto 0) is
+          when x"80" => fastio_rdata <= col_pend & "000" & bk_fs(1) & col_ctr & col_irqen & col_any;
+          when x"82" => fastio_rdata <= col_pidx(7 downto 0);
+          when x"83" => fastio_rdata <= "000000" & col_pidx(9 downto 8);
+          when x"84" =>
+            if col_cbits(to_integer(col_pidx)) = '0' then fastio_rdata <= x"FF";
+            else fastio_rdata <= col_pdata_in(7 downto 0); end if;
+          when x"85" =>
+            if col_cbits(to_integer(col_pidx)) = '0' then fastio_rdata <= x"03";
+            else fastio_rdata <= "000000" & col_pdata_in(9 downto 8); end if;
+          when x"86" => fastio_rdata <= col_ccount(7 downto 0);
+          when x"87" => fastio_rdata <= "000000" & col_ccount(9 downto 8);
+          when x"88" => fastio_rdata <= col_budget(7 downto 0);
+          when x"89" => fastio_rdata <= col_budget(15 downto 8);
+          when x"8A" => fastio_rdata <= obj_tab(3);
+          when x"8B" => fastio_rdata <= "000000" & obj_cnt_hi;
+          when x"8C" => fastio_rdata <= K325T_LEVEL;
+          when others => fastio_rdata <= x"00";
+        end case;
+      end if;
+    elsif cs71 = '1' and fastio_read = '1' then
       n := to_integer(fastio_addr(4 downto 0));
       case fastio_addr(7 downto 0) is
         when x"A0" | x"A1" | x"A2" | x"A3" | x"A4" | x"A5" | x"A6" | x"A7"
@@ -171,14 +224,16 @@ begin
            | x"B8" | x"B9" | x"BA" | x"BB" | x"BC" | x"BD" | x"BE" | x"BF" =>
           fastio_rdata <= unsigned(col_cbits(8 * n + 7 downto 8 * n));
         when x"C0" => fastio_rdata <= col_pend & "00000" & col_irqen & col_any;
-        when x"C1" => fastio_rdata <= col_pidx;
+        when x"C1" => fastio_rdata <= col_pidx(7 downto 0);
         when x"C2" =>
-          if col_cbits(to_integer(col_pidx)) = '0' then
+          if col_cbits(to_integer(col_pidx)) = '0' or col_pdata_in(9 downto 8) /= "00" then
             fastio_rdata <= x"FF";
           else
-            fastio_rdata <= col_pdata_in;
+            fastio_rdata <= col_pdata_in(7 downto 0);
           end if;
-        when x"C3" => fastio_rdata <= col_ccount;
+        when x"C3" =>
+          if col_ccount > 255 then fastio_rdata <= x"FF";
+          else fastio_rdata <= col_ccount(7 downto 0); end if;
         when x"10" => fastio_rdata <= sec;
         when x"11" => fastio_rdata <= min;
         when x"12" => fastio_rdata <= "10" & hour(5 downto 0);   -- 24 h mode
@@ -213,12 +268,22 @@ begin
     if rising_edge(clock) then
       if reset_n = '0' then
         xctl <= x"00";
-        obj_tab <= (others => x"00"); obj_hold <= '0';
-      elsif cs = '1' and fastio_write = '1' and fastio_addr(7 downto 0) = x"F0" then
+        obj_tab <= (others => x"00"); obj_hold <= '0'; obj_cnt_hi <= "00";
+        col_budget <= (others => '0');
+      elsif cs71 = '1' and fastio_write = '1' and fastio_addr(7 downto 0) = x"F0" then
         xctl <= fastio_wdata and XCTL_BITS;
-      elsif cs = '1' and fastio_write = '1' and fastio_addr(7 downto 2) = "111110" then
+      elsif cs71 = '1' and fastio_write = '1' and fastio_addr(7 downto 2) = "111110" then
         obj_tab(to_integer(fastio_addr(1 downto 0))) <= fastio_wdata;
-      elsif cs = '1' and fastio_write = '1' and fastio_addr(7 downto 0) = x"FC" then
+        if fastio_addr(1 downto 0) = "11" then obj_cnt_hi <= "00"; end if;   -- $FFD71FB
+      elsif cs72 = '1' and fastio_write = '1' and fastio_addr(7 downto 0) = x"8A" then
+        obj_tab(3) <= fastio_wdata;
+      elsif cs72 = '1' and fastio_write = '1' and fastio_addr(7 downto 0) = x"8B" then
+        obj_cnt_hi <= fastio_wdata(1 downto 0);
+      elsif cs72 = '1' and fastio_write = '1' and fastio_addr(7 downto 0) = x"88" then
+        col_budget(7 downto 0) <= fastio_wdata;
+      elsif cs72 = '1' and fastio_write = '1' and fastio_addr(7 downto 0) = x"89" then
+        col_budget(15 downto 8) <= fastio_wdata;
+      elsif cs71 = '1' and fastio_write = '1' and fastio_addr(7 downto 0) = x"FC" then
         obj_hold <= fastio_wdata(0);
       end if;
       diag_v1 <= diag_val_in; diag_v2 <= diag_v1;
@@ -226,33 +291,41 @@ begin
       -- buffer, which then stays stable for the rest of the frame)
       col_ts <= col_ts(1 downto 0) & col_toggle_in;
       if col_ts(2) /= col_ts(1) then
-        col_cbits <= col_bits_in; col_ccount <= col_count_in;
-        if col_count_in /= x"00" then
+        col_cbits <= col_bits_in; col_ccount <= col_count_in; col_ctr <= col_trunc_in;
+        if col_count_in /= 0 then
           col_any <= '1'; col_pend <= '1';
         end if;
       end if;
-      if cs = '1' and fastio_write = '1' and fastio_addr(7 downto 0) = x"C0" then
+      bk_fs <= bk_fs(0) & bk_full_in;
+      if (cs71 = '1' and fastio_write = '1' and fastio_addr(7 downto 0) = x"C0")
+         or (cs72 = '1' and fastio_write = '1' and fastio_addr(7 downto 0) = x"80") then
         col_irqen <= fastio_wdata(1);
         if fastio_wdata(0) = '1' then
           col_any <= '0'; col_pend <= '0';
         end if;
       end if;
-      if cs = '1' and fastio_write = '1' and fastio_addr(7 downto 0) = x"C1" then
-        col_pidx <= fastio_wdata;
+      if cs71 = '1' and fastio_write = '1' and fastio_addr(7 downto 0) = x"C1" then
+        col_pidx <= "00" & fastio_wdata;
+      end if;
+      if cs72 = '1' and fastio_write = '1' and fastio_addr(7 downto 0) = x"82" then
+        col_pidx(7 downto 0) <= fastio_wdata;
+      end if;
+      if cs72 = '1' and fastio_write = '1' and fastio_addr(7 downto 0) = x"83" then
+        col_pidx(9 downto 8) <= fastio_wdata(1 downto 0);
       end if;
       if reset_n = '0' then
         col_irqen <= '0'; col_pend <= '0'; col_any <= '0';
       end if;
-      if cs = '1' and fastio_write = '1' and fastio_addr(7 downto 0) = x"E0" then
+      if cs71 = '1' and fastio_write = '1' and fastio_addr(7 downto 0) = x"E0" then
         diag_sel <= fastio_wdata(4 downto 0);
       end if;
-      if cs = '1' and fastio_write = '1' and fastio_addr(7 downto 0) = x"E3" then
+      if cs71 = '1' and fastio_write = '1' and fastio_addr(7 downto 0) = x"E3" then
         diag_clr_t <= not diag_clr_t;
       end if;
-      if cs = '1' and fastio_write = '1' and fastio_addr(7 downto 2) = "111101" then
+      if cs71 = '1' and fastio_write = '1' and fastio_addr(7 downto 2) = "111101" then
         rdma_list(to_integer(fastio_addr(1 downto 0))) <= fastio_wdata;
       end if;
-      if cs = '1' and fastio_write = '1' then
+      if cs71 = '1' and fastio_write = '1' then
         case fastio_addr(7 downto 0) is
           when x"10" => sec   <= fastio_wdata and x"7F"; tick_cnt <= 0;
           when x"11" => min   <= fastio_wdata and x"7F";

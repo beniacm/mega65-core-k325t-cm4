@@ -57,6 +57,8 @@ entity viciv is
     chipram_size : integer := 393216;
     -- K325T: 64 KB colour RAM ($FF80000-$FF8FFFF), 32 KB mirror until colour_ram_64k_en
     colour_ram_64k : boolean := false;
+    -- K325T RRB list mode v3: object table depth (snapshot, 4 RAMB36 at 1024, 2 at 512)
+    rrb_nobj : integer := 1024;
     hyper_installed : boolean := false
     );
   Port (
@@ -207,18 +209,21 @@ entity viciv is
     clear_unpainted_en : in std_logic := '0'; -- XCTL bit 3: unpainted pixels show as background (K325T)
     rrb_v2_en : in std_logic := '0';          -- XCTL bit 6: list mode v2, global object table
     obj_tab_addr : in unsigned(19 downto 0) := (others => '0');   -- $FFD71F8-A
-    obj_count : in unsigned(7 downto 0) := (others => '0');       -- $FFD71FB
+    obj_count : in unsigned(9 downto 0) := (others => '0');       -- $FFD71FB, $FFD728B
     obj_hold : in std_logic := '0';                               -- $FFD71FC bit 0
     -- K325T list mode diagnostic counters ($FFD71E0-3, soft_rtc.vhdl; CPU clock domain)
     diag_sel : in unsigned(4 downto 0) := (others => '0');        -- counter index
     diag_clr : in std_logic := '0';                               -- toggles: clear all counters
     diag_val : out unsigned(15 downto 0) := (others => '0');      -- selected counter (registered)
     -- K325T list mode v2 collisions (rrb_list_expander; read at $FFD71A0-C3 via soft_rtc)
-    col_bits : out std_logic_vector(255 downto 0) := (others => '0');
-    col_count : out unsigned(7 downto 0) := (others => '0');
+    col_bits : out std_logic_vector(1023 downto 0) := (others => '0');
+    col_count : out unsigned(9 downto 0) := (others => '0');
     col_toggle : out std_logic := '0';
-    col_pidx : in unsigned(7 downto 0) := (others => '0');
-    col_pdata : out unsigned(7 downto 0) := (others => '1');
+    col_pidx : in unsigned(9 downto 0) := (others => '0');
+    col_pdata : out unsigned(9 downto 0) := (others => '1');
+    col_budget : in unsigned(15 downto 0) := (others => '0');      -- $FFD7288-9
+    col_trunc : out std_logic := '0';
+    bk_full : out std_logic := '0';
     charrom_fastio_rdata : out std_logic_vector(7 downto 0);
     charrom_cs : in std_logic;
 
@@ -1515,7 +1520,7 @@ begin
   exp_ent_addr <= row_scr_base + list_pos + 2;
 
   rrblist0 : entity work.rrb_list_expander
-    generic map (MLAT => 3, CLAT => 1, LIMIT => RRB_LIST_LIMIT, BUFW => 11)
+    generic map (MLAT => 3, CLAT => 1, LIMIT => RRB_LIST_LIMIT, BUFW => 11, NOBJ => rrb_nobj)
     port map (clk => pixelclock, start => exp_start, abort => exp_abort, ent_addr => exp_ent_addr,
               out_start => list_pos, busy => exp_busy, done => exp_done, out_len => exp_out_len,
               mreq => exp_mreq, maddr => exp_maddr, mdata => final_ramdata,
@@ -1526,7 +1531,8 @@ begin
               mfree => exp_mfree, copying => exp_copying, ofree => exp_ofree, wpos => exp_wpos,
               ovf => exp_ovf, part => exp_part, cstall => exp_cstall,
               col_tick => exp_col_tick, col_bits => col_bits, col_count => col_count,
-              col_toggle => col_toggle, col_pidx => col_pidx, col_pdata => col_pdata);
+              col_toggle => col_toggle, col_pidx => col_pidx, col_pdata => col_pdata,
+              col_budget => col_budget, col_trunc => col_trunc, bk_full => bk_full);
 
   -- K325T list mode diagnostic counters (read at $FFD71E0-3 via soft_rtc).  Stage 1 registers
   -- one bit per event (dg_ev); stage 2 counts them (16 bits, saturating at $FFFF, except the
