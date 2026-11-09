@@ -187,6 +187,11 @@ architecture rtl of rk_bridge is
   -- latency is invisible (the prefetch at the command byte covers the first data byte).
   signal wbuf_q     : std_logic_vector(7 downto 0) := (others => '0');
   signal stat_q     : std_logic_vector(7 downto 0) := (others => '0');   -- STATUS byte, registered
+  -- early MISO: the bit miso_r takes at the next rising SCK edge, prepared between edges (nxt_pre
+  -- = the byte the boundary arm below will send, mbit_r = its MSB or the next bit of tx_sr), so
+  -- miso_r can take it one clock earlier, from the first input stage (see the SPI slave)
+  signal nxt_pre    : std_logic_vector(7 downto 0) := (others => '0');
+  signal mbit_r     : std_logic := '0';
   signal rd_ready_r : std_logic := '0';
   signal rd_error_r : std_logic := '0';
   signal wr_ack_r   : std_logic := '0';
@@ -530,6 +535,30 @@ begin
           end if;
           fl_phase <= fl_phase + 1;
         end if;
+      end if;
+
+      -- early MISO (one clock162 cycle = 6.2 ns more margin for the master's sample): when the
+      -- rising SCK edge is in the first input stage (sck_s(0) = 1, sck_s(1) = 0), miso_r takes
+      -- the prepared bit now; the edge detection below (sck_s(1)/sck_s(2), unchanged) assigns the
+      -- same bit one cycle later.  sck_s(0) feeds only this LUT and sck_s(1): if it resolves late,
+      -- miso_r changes one cycle later (as before), and the FSM never sees the unresolved stage.
+      if bidx = 0 then
+        nxt_pre <= x"00";
+      else
+        case cmd is
+          when x"01" => nxt_pre <= stat_q;
+          when x"11" => nxt_pre <= wbuf_q;
+          when x"21" =>
+            if rxf_wp_d2 /= rxf_pp then nxt_pre <= rxf_dout; else nxt_pre <= x"00"; end if;
+          when x"40" => nxt_pre <= eth_tx_rdata;
+          when x"50" =>
+            if bidx > 2 then nxt_pre <= fl_resp; else nxt_pre <= x"00"; end if;
+          when others => nxt_pre <= x"00";
+        end case;
+      end if;
+      if bitcnt /= 7 then mbit_r <= tx_sr(6); else mbit_r <= nxt_pre(7); end if;
+      if cs_s(1) = '0' and sck_s(1) = '0' and sck_s(0) = '1' then
+        miso_r <= mbit_r;
       end if;
 
       if cs_s(1) = '1' then
