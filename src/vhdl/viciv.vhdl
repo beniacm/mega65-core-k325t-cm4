@@ -206,6 +206,7 @@ entity viciv is
     fast_rrb_en : in std_logic := '0';        -- XCTL bit 4: paint 2 pixels per cycle (K325T)
     rrb_list_en : in std_logic := '0';        -- XCTL bit 5: RRB list mode (K325T, upstream #747)
     fast_token_en : in std_logic := '0';      -- XCTL bit 7 (with bit 4): fast token path (K325T)
+    quad_px_en : in std_logic := '0';         -- XCTL2 bit 0 (with XCTL bits 4 + 7): 4 px painting
     clear_unpainted_en : in std_logic := '0'; -- XCTL bit 3: unpainted pixels show as background (K325T)
     rrb_v2_en : in std_logic := '0';          -- XCTL bit 6: list mode v2, global object table
     obj_tab_addr : in unsigned(19 downto 0) := (others => '0');   -- $FFD71F8-A
@@ -1001,7 +1002,7 @@ architecture Behavioral of viciv is
   signal raster_buffer_read_address_sub : unsigned(9 downto 0) := to_unsigned(0,9+1);
   signal raster_buffer_read_address_next : unsigned(10 downto 0) := to_unsigned(0,10+1);
   signal raster_buffer_read_address_sub_next : unsigned(9 downto 0) := to_unsigned(0,9+1);
-  signal raster_buffer_read_data : unsigned(17 downto 0) := to_unsigned(0,17+1);
+  signal raster_buffer_read_data : unsigned(17 downto 0);
   signal raster_buffer_write_address : unsigned(10 downto 0) := to_unsigned(0,10+1);
   signal raster_buffer_write_data : unsigned(17 downto 0) := to_unsigned(0,17+1);
   signal raster_buffer_write : std_logic := '0';
@@ -1014,11 +1015,13 @@ architecture Behavioral of viciv is
   signal rb_double : std_logic := '0';
   signal raster_buffer_write2 : std_logic := '0';
   signal raster_buffer_write_data2 : unsigned(17 downto 0) := (others => '0');
-  signal rb_addr0, rb_addr1 : unsigned(10 downto 0) := (others => '0');
-  signal rb_din0, rb_din1 : unsigned(17 downto 0) := (others => '0');
-  signal rb_we0, rb_we1 : std_logic := '0';
-  signal rb_dout0, rb_dout1 : unsigned(17 downto 0) := (others => '0');
-  signal rb_rsel : std_logic := '0';
+  -- K325T step 7 (XCTL2 bit 0, 4 px painting): rb_quad = this cycle writes four pixels, 1..4 at
+  -- raster_buffer_write_address - 3 .. raster_buffer_write_address (data, data2, data3, data4)
+  signal rb_quad : std_logic := '0';
+  signal quad_s : std_logic_vector(1 downto 0) := "00";       -- quad_px_en, synchronised
+  signal rb_q17 : std_logic := '0';                           -- bit 17 chain after a 4 px step
+  signal raster_buffer_write3, raster_buffer_write4 : std_logic := '0';
+  signal raster_buffer_write_data3, raster_buffer_write_data4 : unsigned(17 downto 0) := (others => '0');
   -- K325T XCTL bit 3 (cu_*): a pixel not painted in this painting of its buffer half shows as
   -- background (screen colour, alpha $FF, not foreground), and the line runs to the full text
   -- width.  One valid bit per pixel of each half and bank, in flip-flops: the write half's bits
@@ -1030,7 +1033,6 @@ architecture Behavioral of viciv is
   signal cu_clr_half : std_logic := '0';
   signal cu_clr_cnt : integer range 0 to 7 := 0;
   signal cu_vq : std_logic;
-  signal rb_raddr : unsigned(10 downto 0) := (others => '0');
 
   -- one painted pixel as the raster buffer word (bit 17 alt palette, 16..9 alpha,
   -- 8 foreground, 7..0 colour) -- exactly what the 1-pixel paint states write
@@ -1345,62 +1347,8 @@ architecture Behavioral of viciv is
 
 begin
 
-  -- Raster buffer as even/odd pixel banks (K325T fast RRB; one write per bank per cycle).
-  -- Single writes (all of upstream's paint states): the bank of the address.  Double writes:
-  -- pixel 1 at address-1 and pixel 2 at address are always in different banks.
-  process (raster_buffer_write_address, raster_buffer_write, raster_buffer_write_data,
-           rb_double, raster_buffer_write2, raster_buffer_write_data2)
-    variable a1 : unsigned(10 downto 0);
-  begin
-    rb_addr0 <= resize(raster_buffer_write_address(10 downto 1), 11);
-    rb_addr1 <= resize(raster_buffer_write_address(10 downto 1), 11);
-    rb_din0 <= raster_buffer_write_data;
-    rb_din1 <= raster_buffer_write_data;
-    rb_we0 <= raster_buffer_write and not raster_buffer_write_address(0);
-    rb_we1 <= raster_buffer_write and raster_buffer_write_address(0);
-    if rb_double = '1' then
-      a1 := raster_buffer_write_address;
-      a1(9 downto 0) := raster_buffer_write_address(9 downto 0) - 1;
-      if raster_buffer_write_address(0) = '1' then
-        -- pixel 1 even (bank 0 @ a1/2), pixel 2 odd (bank 1 @ addr/2)
-        rb_addr0 <= resize(a1(10 downto 1), 11);
-        rb_din0 <= raster_buffer_write_data;  rb_we0 <= raster_buffer_write;
-        rb_din1 <= raster_buffer_write_data2; rb_we1 <= raster_buffer_write2;
-      else
-        -- pixel 1 odd (bank 1 @ a1/2), pixel 2 even (bank 0 @ addr/2)
-        rb_addr1 <= resize(a1(10 downto 1), 11);
-        rb_din1 <= raster_buffer_write_data;  rb_we1 <= raster_buffer_write;
-        rb_din0 <= raster_buffer_write_data2; rb_we0 <= raster_buffer_write2;
-      end if;
-    end if;
-  end process;
-
-
-  rasterbuffer_even: entity work.ram18x2k
-    port map (
-      clkl => pixelclock,
-      clkr => pixelclock,
-      wel(0) => rb_we0,
-      dinl => std_logic_vector(rb_din0),
-      unsigned(doutr) => rb_dout0,
-      addrl => std_logic_vector(rb_addr0),
-      addrr => std_logic_vector(rb_raddr)
-      );
-  rasterbuffer_odd: entity work.ram18x2k
-    port map (
-      clkl => pixelclock,
-      clkr => pixelclock,
-      wel(0) => rb_we1,
-      dinl => std_logic_vector(rb_din1),
-      unsigned(doutr) => rb_dout1,
-      addrl => std_logic_vector(rb_addr1),
-      addrr => std_logic_vector(rb_raddr)
-      );
-  process (pixelclock) begin
-    if rising_edge(pixelclock) then rb_rsel <= raster_buffer_read_address_next(0); end if;
-  end process;
-  raster_buffer_read_data <= rb_dout1 when rb_rsel = '1' else rb_dout0;
-  rb_raddr <= resize(raster_buffer_read_address_next(10 downto 1), 11);
+  -- Raster buffer (K325T): four pixel banks in rrb_list_frontend.vhdl (1, 2 or 4 pixels per
+  -- painting cycle at any alignment; the display reads raster_buffer_read_data as before)
 
   buffer1: entity work.screen_ram_buffer
     port map (
@@ -1486,9 +1434,13 @@ begin
   frontend: entity work.rrb_list_frontend
     generic map (LIMIT => RRB_LIST_LIMIT)
     port map (clk => pixelclock,
-              rb_we0 => rb_we0, rb_we1 => rb_we1, rb_addr0 => rb_addr0, rb_addr1 => rb_addr1,
-              cu_clr => cu_clr, cu_clr_half => cu_clr_half,
-              rb_raddr_next => raster_buffer_read_address_next, cu_vq => cu_vq,
+              rb_wa => raster_buffer_write_address, rb_write => raster_buffer_write,
+              rb_write2 => raster_buffer_write2, rb_write3 => raster_buffer_write3,
+              rb_write4 => raster_buffer_write4, rb_wd1 => raster_buffer_write_data,
+              rb_wd2 => raster_buffer_write_data2, rb_wd3 => raster_buffer_write_data3,
+              rb_wd4 => raster_buffer_write_data4, rb_double => rb_double, rb_quad => rb_quad,
+              rb_raddr_next => raster_buffer_read_address_next, rb_rdata => raster_buffer_read_data,
+              cu_clr => cu_clr, cu_clr_half => cu_clr_half, cu_vq => cu_vq,
               exp_busy => exp_busy, exp_wpos => exp_wpos, exp_wpos_d => exp_wpos_d,
               cc_v1 => cc_v1, cc_i1 => cc_i1, colourramdata_ram => colourramdata_ram,
               exp_bwe => exp_bwe, exp_baddr => exp_baddr, exp_bcolour => exp_bcolour,
@@ -1506,9 +1458,8 @@ begin
               list_pos => list_pos, row_end_pos => row_end_pos,
               before_y_chargen_start => before_y_chargen_start,
               justbefore_y_chargen_start => justbefore_y_chargen_start,
-              rb_write => raster_buffer_write, rb_write2 => raster_buffer_write2,
-              rb_wa => raster_buffer_write_address, rb_ra => raster_buffer_read_address,
-              rb_double => rb_double, chargen_active => chargen_active, xcounter => xcounter,
+              rb_ra => raster_buffer_read_address,
+              chargen_active => chargen_active, xcounter => xcounter,
               ycounter => ycounter, paint_ready => paint_ready, glyph_goto => glyph_goto,
               list_in_exp => list_in_exp, list_save_armed => list_save_armed,
               diag_sel => diag_sel, diag_clr => diag_clr, diag_val => diag_val);
@@ -3391,6 +3342,9 @@ begin
     variable next_glyph_number_temp : std_logic_vector(12 downto 0) := (others => '0');
     variable next_glyph_colour_temp : std_logic_vector(7 downto 0) := (others => '0');
     variable rb_v1, rb_v2 : unsigned(17 downto 0);    -- K325T fast RRB pixels
+    variable rb_v3, rb_v4 : unsigned(17 downto 0);    -- K325T 4 px painting
+    variable quad_ok : boolean;
+    variable c17 : std_logic;
     variable yf : unsigned(11 downto 0);              -- K325T list mode: fetch side's displayy
     -- K325T fast token path
     variable fs_now, p_last, fast_ok, t_disp_fcm, t_disp_mono : boolean;
@@ -3434,12 +3388,16 @@ begin
       t_disp_fcm := false; t_disp_mono := false;
       fds := fp_dec;
       fast_ok := rb_fast_s(1) = '1' and (raster_buffer_write_address(9 downto 0) <= 1020 or rrb_wraparound_allowed = '1');
+      -- K325T step 7: four pixels per cycle (XCTL2 bit 0 with XCTL bits 4 and 7)
+      quad_ok := quad_s(1) = '1' and rb_fast_s(1) = '1' and fp_s(1) = '1'
+                 and (raster_buffer_write_address(9 downto 0) <= 1018 or rrb_wraparound_allowed = '1');
       case paint_fsm_state is
         when PaintFullColourPixels | Paint4bitColourPixels =>
           p_last := (fast_ok and paint_bits_remaining = 1) or (not fast_ok and paint_bits_remaining = 0)
-                    or (fast_ok and paint_bits_remaining = 0);
+                    or (fast_ok and paint_bits_remaining = 0) or (quad_ok and paint_bits_remaining = 3);
         when PaintMonoBits =>
-          p_last := (fast_ok and paint_bits_remaining = 2) or (paint_bits_remaining <= 1);
+          p_last := (fast_ok and paint_bits_remaining = 2) or (paint_bits_remaining <= 1)
+                    or (quad_ok and paint_bits_remaining = 4);
         when others =>
           p_last := false;
       end case;
@@ -6163,6 +6121,9 @@ begin
       end if;
       rb_double <= '0';
       raster_buffer_write2 <= '0';
+      rb_quad <= '0';
+      raster_buffer_write3 <= '0'; raster_buffer_write4 <= '0';
+      quad_s <= quad_s(0) & quad_px_en;          -- K325T step 7
       case paint_fsm_state is
         when Idle =>
           if paint_ready /= '1' then
@@ -6190,7 +6151,37 @@ begin
             paint_fsm_state <= PaintFullColourPixels;
           end if;
         when Paint4bitColourPixels =>
-          if rb_fast_s(1) = '1' and paint_bits_remaining >= 1 and (raster_buffer_write_address(9 downto 0) <= 1020 or rrb_wraparound_allowed = '1') then
+          if quad_ok and paint_bits_remaining >= 3 then
+            -- K325T 4 px painting: four nybls per cycle (two of the 2 px steps)
+            c17 := raster_buffer_write_data(17);
+            rb_v1 := rb_nib_px(paint_full_colour_data(3 downto 0), paint_with_alpha, force_chars_foreground,
+                               force_chars_background, paint_foreground, paint_background_with_any_reverse, c17);
+            rb_v2 := rb_nib_px(paint_full_colour_data(7 downto 4), paint_with_alpha, force_chars_foreground,
+                               force_chars_background, paint_foreground, paint_background_with_any_reverse, rb_v1(17));
+            rb_v3 := rb_nib_px(paint_full_colour_data(11 downto 8), paint_with_alpha, force_chars_foreground,
+                               force_chars_background, paint_foreground, paint_background_with_any_reverse, rb_v1(17));
+            rb_v4 := rb_nib_px(paint_full_colour_data(15 downto 12), paint_with_alpha, force_chars_foreground,
+                               force_chars_background, paint_foreground, paint_background_with_any_reverse, rb_v3(17));
+            raster_buffer_write_data <= rb_v1; raster_buffer_write_data2 <= rb_v2;
+            raster_buffer_write_data3 <= rb_v3; raster_buffer_write_data4 <= rb_v4;
+            if paint_full_colour_data(3 downto 0) /= x"0" or glyph_paint_background = '1' then
+              raster_buffer_write <= '1'; else raster_buffer_write <= '0'; end if;
+            if paint_full_colour_data(7 downto 4) /= x"0" or glyph_paint_background = '1' then
+              raster_buffer_write2 <= '1'; else raster_buffer_write2 <= '0'; end if;
+            if paint_full_colour_data(11 downto 8) /= x"0" or glyph_paint_background = '1' then
+              raster_buffer_write3 <= '1'; else raster_buffer_write3 <= '0'; end if;
+            if paint_full_colour_data(15 downto 12) /= x"0" or glyph_paint_background = '1' then
+              raster_buffer_write4 <= '1'; else raster_buffer_write4 <= '0'; end if;
+            paint_full_colour_data(47 downto 0) <= paint_full_colour_data(63 downto 16);
+            raster_buffer_write_address(9 downto 0) <= raster_buffer_write_address(9 downto 0) + 4;
+            raster_buffer_max_write_address <= raster_buffer_write_address(9 downto 0) + 4;
+            rb_quad <= '1'; rb_q17 <= rb_v3(17);
+            if paint_bits_remaining = 3 then
+              paint_fsm_state <= Idle;
+            else
+              paint_bits_remaining <= paint_bits_remaining - 4;
+            end if;
+          elsif rb_fast_s(1) = '1' and paint_bits_remaining >= 1 and (raster_buffer_write_address(9 downto 0) <= 1020 or rrb_wraparound_allowed = '1') then
             -- K325T fast RRB: two nybls per cycle
             rb_v1 := rb_nib_px(paint_full_colour_data(3 downto 0), paint_with_alpha, force_chars_foreground,
                                force_chars_background, paint_foreground, paint_background_with_any_reverse,
@@ -6274,11 +6265,47 @@ begin
             end if;
           end if;
         when PaintFullColourPixels =>
-          if rb_fast_s(1) = '1' and paint_bits_remaining >= 1 and (raster_buffer_write_address(9 downto 0) <= 1020 or rrb_wraparound_allowed = '1') then
-            -- K325T fast RRB: two bytes per cycle
+          if quad_ok and paint_bits_remaining >= 3 then
+            -- K325T 4 px painting: four bytes per cycle, as two of the 2 px steps (bit 17, the
+            -- palette select, chains from each step's first pixel as there)
+            if rb_quad = '1' then c17 := rb_q17; else c17 := raster_buffer_write_data(17); end if;
             rb_v1 := rb_fcm_px(paint_full_colour_data(7 downto 0), paint_with_alpha, force_chars_foreground,
                                force_chars_background, transparent_pixel_will_come_from_primary_palette,
-                               paint_foreground, paint_background_with_any_reverse, raster_buffer_write_data(17));
+                               paint_foreground, paint_background_with_any_reverse, c17);
+            rb_v2 := rb_fcm_px(paint_full_colour_data(15 downto 8), paint_with_alpha, force_chars_foreground,
+                               force_chars_background, transparent_pixel_will_come_from_primary_palette,
+                               paint_foreground, paint_background_with_any_reverse, rb_v1(17));
+            rb_v3 := rb_fcm_px(paint_full_colour_data(23 downto 16), paint_with_alpha, force_chars_foreground,
+                               force_chars_background, transparent_pixel_will_come_from_primary_palette,
+                               paint_foreground, paint_background_with_any_reverse, rb_v1(17));
+            rb_v4 := rb_fcm_px(paint_full_colour_data(31 downto 24), paint_with_alpha, force_chars_foreground,
+                               force_chars_background, transparent_pixel_will_come_from_primary_palette,
+                               paint_foreground, paint_background_with_any_reverse, rb_v3(17));
+            raster_buffer_write_data <= rb_v1; raster_buffer_write_data2 <= rb_v2;
+            raster_buffer_write_data3 <= rb_v3; raster_buffer_write_data4 <= rb_v4;
+            if paint_full_colour_data(7 downto 0) /= x"00" or glyph_paint_background = '1' then
+              raster_buffer_write <= '1'; else raster_buffer_write <= '0'; end if;
+            if paint_full_colour_data(15 downto 8) /= x"00" or glyph_paint_background = '1' then
+              raster_buffer_write2 <= '1'; else raster_buffer_write2 <= '0'; end if;
+            if paint_full_colour_data(23 downto 16) /= x"00" or glyph_paint_background = '1' then
+              raster_buffer_write3 <= '1'; else raster_buffer_write3 <= '0'; end if;
+            if paint_full_colour_data(31 downto 24) /= x"00" or glyph_paint_background = '1' then
+              raster_buffer_write4 <= '1'; else raster_buffer_write4 <= '0'; end if;
+            paint_full_colour_data(31 downto 0) <= paint_full_colour_data(63 downto 32);
+            raster_buffer_write_address(9 downto 0) <= raster_buffer_write_address(9 downto 0) + 4;
+            raster_buffer_max_write_address <= raster_buffer_write_address(9 downto 0) + 4;
+            rb_quad <= '1'; rb_q17 <= rb_v3(17);
+            if paint_bits_remaining = 3 then
+              paint_fsm_state <= Idle;
+            else
+              paint_bits_remaining <= paint_bits_remaining - 4;
+            end if;
+          elsif rb_fast_s(1) = '1' and paint_bits_remaining >= 1 and (raster_buffer_write_address(9 downto 0) <= 1020 or rrb_wraparound_allowed = '1') then
+            -- K325T fast RRB: two bytes per cycle (after a 4 px step: its second pair's chain)
+            if rb_quad = '1' then c17 := rb_q17; else c17 := raster_buffer_write_data(17); end if;
+            rb_v1 := rb_fcm_px(paint_full_colour_data(7 downto 0), paint_with_alpha, force_chars_foreground,
+                               force_chars_background, transparent_pixel_will_come_from_primary_palette,
+                               paint_foreground, paint_background_with_any_reverse, c17);
             rb_v2 := rb_fcm_px(paint_full_colour_data(15 downto 8), paint_with_alpha, force_chars_foreground,
                                force_chars_background, transparent_pixel_will_come_from_primary_palette,
                                paint_foreground, paint_background_with_any_reverse, rb_v1(17));
@@ -6442,7 +6469,31 @@ begin
           report "LEGACY: clearing paint_ready";
           paint_fsm_state <= PaintMonoBits;
         when PaintMonoBits =>
-          if rb_fast_s(1) = '1' and paint_bits_remaining >= 2 and (raster_buffer_write_address(9 downto 0) <= 1020 or rrb_wraparound_allowed = '1') then
+          if quad_ok and paint_bits_remaining >= 4 then
+            -- K325T 4 px painting: four bits per cycle
+            rb_v1 := rb_mono_px(paint_buffer(0), force_chars_foreground, force_chars_background,
+                                paint_foreground, paint_background, raster_buffer_write_data(17));
+            rb_v2 := rb_mono_px(paint_buffer(1), force_chars_foreground, force_chars_background,
+                                paint_foreground, paint_background, raster_buffer_write_data(17));
+            rb_v3 := rb_mono_px(paint_buffer(2), force_chars_foreground, force_chars_background,
+                                paint_foreground, paint_background, raster_buffer_write_data(17));
+            rb_v4 := rb_mono_px(paint_buffer(3), force_chars_foreground, force_chars_background,
+                                paint_foreground, paint_background, raster_buffer_write_data(17));
+            raster_buffer_write_data <= rb_v1; raster_buffer_write_data2 <= rb_v2;
+            raster_buffer_write_data3 <= rb_v3; raster_buffer_write_data4 <= rb_v4;
+            raster_buffer_write <= paint_buffer(0) or glyph_paint_background;
+            raster_buffer_write2 <= paint_buffer(1) or glyph_paint_background;
+            raster_buffer_write3 <= paint_buffer(2) or glyph_paint_background;
+            raster_buffer_write4 <= paint_buffer(3) or glyph_paint_background;
+            paint_buffer <= "0000" & paint_buffer(7 downto 4);
+            raster_buffer_write_address(9 downto 0) <= raster_buffer_write_address(9 downto 0) + 4;
+            raster_buffer_max_write_address <= raster_buffer_write_address(9 downto 0) + 4;
+            rb_quad <= '1';
+            paint_bits_remaining <= paint_bits_remaining - 4;
+            if paint_bits_remaining = 4 then
+              paint_fsm_state <= Idle;
+            end if;
+          elsif rb_fast_s(1) = '1' and paint_bits_remaining >= 2 and (raster_buffer_write_address(9 downto 0) <= 1020 or rrb_wraparound_allowed = '1') then
             -- K325T fast RRB: two bits per cycle
             rb_v1 := rb_mono_px(paint_buffer(0), force_chars_foreground, force_chars_background,
                                 paint_foreground, paint_background, raster_buffer_write_data(17));
@@ -6578,7 +6629,35 @@ begin
           report "LEGACY: clearing paint_ready";
           paint_fsm_state <= PaintMultiColourBits;
         when PaintMultiColourBits =>
-          if rb_fast_s(1) = '1' and paint_bits_remaining /= 0 and (raster_buffer_write_address(9 downto 0) <= 1020 or rrb_wraparound_allowed = '1') then
+          if quad_ok and paint_bits_remaining >= 2 then
+            -- K325T 4 px painting: two double-wide multicolour pixels per cycle
+            rb_v1 := rb_mc_px(paint_buffer(1 downto 0), force_chars_foreground, force_chars_background,
+                              paint_foreground, paint_background, paint_mc1, paint_mc2,
+                              raster_buffer_write_data(17));
+            rb_v3 := rb_mc_px(paint_buffer(3 downto 2), force_chars_foreground, force_chars_background,
+                              paint_foreground, paint_background, paint_mc1, paint_mc2,
+                              raster_buffer_write_data(17));
+            raster_buffer_write_data <= rb_v1; raster_buffer_write_data2 <= rb_v1;
+            raster_buffer_write_data3 <= rb_v3; raster_buffer_write_data4 <= rb_v3;
+            if paint_buffer(1 downto 0) /= "00" or glyph_paint_background = '1' then
+              raster_buffer_write <= '1'; raster_buffer_write2 <= '1';
+            else
+              raster_buffer_write <= '0'; raster_buffer_write2 <= '0';
+            end if;
+            if paint_buffer(3 downto 2) /= "00" or glyph_paint_background = '1' then
+              raster_buffer_write3 <= '1'; raster_buffer_write4 <= '1';
+            else
+              raster_buffer_write3 <= '0'; raster_buffer_write4 <= '0';
+            end if;
+            paint_buffer <= "0000" & paint_buffer(7 downto 4);
+            raster_buffer_write_address(9 downto 0) <= raster_buffer_write_address(9 downto 0) + 4;
+            raster_buffer_max_write_address <= raster_buffer_write_address(9 downto 0) + 4;
+            rb_quad <= '1';
+            paint_bits_remaining <= paint_bits_remaining - 2;
+            if paint_bits_remaining = 2 then
+              paint_fsm_state <= Idle;
+            end if;
+          elsif rb_fast_s(1) = '1' and paint_bits_remaining /= 0 and (raster_buffer_write_address(9 downto 0) <= 1020 or rrb_wraparound_allowed = '1') then
             -- K325T fast RRB: one double-wide multicolour pixel per cycle (no Hold state)
             rb_v1 := rb_mc_px(paint_buffer(1 downto 0), force_chars_foreground, force_chars_background,
                               paint_foreground, paint_background, paint_mc1, paint_mc2,

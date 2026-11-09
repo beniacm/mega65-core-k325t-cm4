@@ -717,6 +717,7 @@ architecture Behavioral of machine is
   signal pixel_y : unsigned (11 downto 0);
   signal vicii_raster : unsigned (11 downto 0);
   signal xctl : unsigned(7 downto 0);               -- K325T extension control ($FFD71F0)
+  signal xctl2 : unsigned(7 downto 0);              -- K325T XCTL2 ($FFD71F1)
   signal xobj : unsigned(30 downto 0);              -- K325T list mode v3 ($FFD71F8-FC, $FFD728B)
   signal col_budget : unsigned(15 downto 0);        -- collision pair budget ($FFD7288-9)
   signal col_trunc, bk_full : std_logic;
@@ -1393,6 +1394,7 @@ begin
       colour_ram_64k_en => xctl(2),
       fast_rrb_en => xctl(4),
       fast_token_en => xctl(7),
+      quad_px_en => xctl2(0),
       clear_unpainted_en => xctl(3),
       rrb_list_en => xctl(5),
       rrb_v2_en => xctl(6),
@@ -1805,7 +1807,7 @@ begin
       data_i => fastio_wdata, data_o => fastio_rdata,
       hyppo_rdata => hyppo_rdata,
       hyppo_address => hyppo_address,
-      xctl_out => xctl,
+      xctl_out => xctl, xctl2_out => xctl2,
       xobj_out => xobj, col_budget_out => col_budget,
       diag_sel_out => rrb_diag_sel,
       diag_clr_out => rrb_diag_clr,

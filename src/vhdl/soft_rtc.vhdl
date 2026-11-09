@@ -16,6 +16,8 @@
 --   bit 7 = fast token path (VIC-IV, with bit 4: CHR16 text tokens pipelined, full-colour
 --   glyph rows as two 32-bit chip RAM reads); bit 3 = unpainted pixels show as background (VIC-IV:
 --   no stale raster buffer pixels, lines run to the full text width)
+-- $FFD71F1: XCTL2 (read/write, cleared by reset): bit 0 = 4 px painting (VIC-IV, with XCTL bits 4
+--   and 7: the painter writes four pixels per cycle); bits 7..1 reserved, read 0
 -- $FFD71F4-$FFD71F7: raster DMA list address (28 bits, little endian)
 -- $FFD71F8-$FFD71FA: list mode v3 object table address in chip RAM (20 bits, little endian)
 -- $FFD71FB: number of objects, low byte (a write also clears the high bits: 0..255 for old
@@ -97,6 +99,7 @@ entity soft_rtc is
     fastio_wdata : in  unsigned(7 downto 0);
     fastio_rdata : out unsigned(7 downto 0);
     xctl_out     : out unsigned(7 downto 0);
+    xctl2_out    : out unsigned(7 downto 0);    -- $FFD71F1 (bit 0 only)
     xobj_out     : out unsigned(30 downto 0);   -- list mode v3 (VIC-IV): hold & count & table
     col_budget_out : out unsigned(15 downto 0);  -- pair budget per collision pass
     diag_sel_out : out unsigned(4 downto 0);    -- list mode diagnostic counters (VIC-IV)
@@ -122,6 +125,7 @@ architecture rtl of soft_rtc is
   signal dow            : unsigned(7 downto 0) := x"00";
   signal tick_cnt       : integer range 0 to clock_frequency - 1 := 0;
   signal xctl           : unsigned(7 downto 0) := x"00";       -- $FFD71F0
+  signal xctl2          : std_logic := '0';                    -- $FFD71F1 bit 0
   constant XCTL_BITS    : unsigned(7 downto 0) := x"FF";       -- implemented bits
   -- $FFD71FD: K325T extension level (1 = XCTL bits 0-7 incl. bit 3; 2 = + collides-with mask
   -- (+15) and the list mode expansion overlapping the painting, 2 KB list rows)
@@ -174,6 +178,7 @@ architecture rtl of soft_rtc is
   end function;
 begin
   xctl_out <= xctl;
+  xctl2_out <= "0000000" & xctl2;
   xobj_out <= obj_hold & obj_cnt_hi & obj_tab(3) & obj_tab(2)(3 downto 0) & obj_tab(1) & obj_tab(0);
   col_budget_out <= col_budget;
   cs71 <= cs when fastio_addr(11 downto 8) = x"1" else '0';
@@ -245,6 +250,7 @@ begin
         when x"E1" => fastio_rdata <= diag_v2(7 downto 0);
         when x"E2" => fastio_rdata <= diag_v2(15 downto 8);
         when x"F0" => fastio_rdata <= xctl;
+        when x"F1" => fastio_rdata <= "0000000" & xctl2;
         when x"F4" => fastio_rdata <= rdma_list(0);
         when x"F5" => fastio_rdata <= rdma_list(1);
         when x"F6" => fastio_rdata <= rdma_list(2);
@@ -267,11 +273,13 @@ begin
   begin
     if rising_edge(clock) then
       if reset_n = '0' then
-        xctl <= x"00";
+        xctl <= x"00"; xctl2 <= '0';
         obj_tab <= (others => x"00"); obj_hold <= '0'; obj_cnt_hi <= "00";
         col_budget <= (others => '0');
       elsif cs71 = '1' and fastio_write = '1' and fastio_addr(7 downto 0) = x"F0" then
         xctl <= fastio_wdata and XCTL_BITS;
+      elsif cs71 = '1' and fastio_write = '1' and fastio_addr(7 downto 0) = x"F1" then
+        xctl2 <= fastio_wdata(0);
       elsif cs71 = '1' and fastio_write = '1' and fastio_addr(7 downto 2) = "111110" then
         obj_tab(to_integer(fastio_addr(1 downto 0))) <= fastio_wdata;
         if fastio_addr(1 downto 0) = "11" then obj_cnt_hi <= "00"; end if;   -- $FFD71FB

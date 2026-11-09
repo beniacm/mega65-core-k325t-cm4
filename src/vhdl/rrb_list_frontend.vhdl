@@ -2,7 +2,10 @@
 -- rrb_list_frontend.vhdl -- the parts of the K325T RRB list mode (docs/rrb_list_mode.md in the
 -- lab repository) that live beside the VIC-IV's raster FSM rather than in it, moved out of
 -- viciv.vhdl unchanged (a pure refactor: same registers, same cycles):
---   * XCTL bit 3: one valid bit per raster buffer pixel (both halves, both banks), set by every
+--   * the raster line buffer itself (K325T step 7): four banks by pixel x mod 4, so a painting
+--     cycle can write 1, 2 (fast RRB) or 4 adjacent pixels (4 px painting, XCTL2 bit 0) at any
+--     alignment; the display reads one pixel per read cycle, as before (one cycle latency);
+--   * XCTL bit 3: one valid bit per raster buffer pixel (both halves, all banks), set by every
 --     raster buffer write, cleared for the write half after the line start; the display reads
 --     the bit with the pixel (cu_vq);
 --   * the colour row buffer of list rows (cbuf: the row's own colour bytes copied during the
@@ -22,12 +25,18 @@ entity rrb_list_frontend is
   generic ( LIMIT : integer := 2044 );           -- row buffer limit of the expansion
   port (
     clk              : in  std_logic;            -- the VIC-IV pixel clock
-    -- XCTL bit 3: raster buffer writes (both banks), clear, the display's read address
-    rb_we0, rb_we1   : in  std_logic;
-    rb_addr0, rb_addr1 : in unsigned(10 downto 0);
+    -- raster buffer: the painter's write (address = the LAST pixel written; 1 pixel, rb_double:
+    -- 2 pixels at wa-1 (data 1) and wa (data 2), rb_quad: 4 pixels at wa-3 .. wa (data 1..4)),
+    -- the display's read address (next cycle's), the pixel it reads
+    rb_wa            : in  unsigned(10 downto 0);
+    rb_write, rb_write2, rb_write3, rb_write4 : in std_logic;
+    rb_wd1, rb_wd2, rb_wd3, rb_wd4 : in unsigned(17 downto 0);
+    rb_double, rb_quad : in std_logic;
+    rb_raddr_next    : in  unsigned(10 downto 0);
+    rb_rdata         : out unsigned(17 downto 0);
+    -- XCTL bit 3: clear, the valid bit of the pixel read
     cu_clr           : in  std_logic;
     cu_clr_half      : in  std_logic;
-    rb_raddr_next    : in  unsigned(10 downto 0);
     cu_vq            : out std_logic := '1';
     -- colour row buffer
     exp_busy         : in  std_logic;
@@ -55,9 +64,7 @@ entity rrb_list_frontend is
     list_found, rv2, row_ff, row_short : in std_logic;
     list_pos, row_end_pos : in unsigned(10 downto 0);
     before_y_chargen_start, justbefore_y_chargen_start : in std_logic;
-    rb_write, rb_write2 : in std_logic;          -- raster_buffer_write / _write2
-    rb_wa, rb_ra     : in  unsigned(10 downto 0); -- raster buffer write / read address
-    rb_double        : in  std_logic;
+    rb_ra            : in  unsigned(10 downto 0); -- raster buffer read address
     chargen_active   : in  std_logic;
     xcounter         : in  unsigned(13 downto 0);
     ycounter         : in  unsigned(11 downto 0);
@@ -70,10 +77,24 @@ end entity;
 
 architecture rtl of rrb_list_frontend is
   constant display_fetch_start : unsigned(11 downto 0) := to_unsigned(719, 12);   -- as viciv
-  -- XCTL bit 3 valid bits
-  signal cu_v0, cu_v1 : std_logic_vector(1023 downto 0) := (others => '0');   -- even / odd bank
-  signal cu_we0, cu_we1 : std_logic := '0';
-  signal cu_a0, cu_a1 : unsigned(9 downto 0) := (others => '0');
+  -- raster buffer: four banks (pixel x mod 4) of 2 halves x 256 pixels
+  type rbank_t is array (0 to 511) of unsigned(17 downto 0);
+  type rbanks_t is array (0 to 3) of rbank_t;
+  signal rbank : rbanks_t;
+  attribute ram_style : string;
+  attribute ram_style of rbank : signal is "block";
+  type rba_t is array (0 to 3) of unsigned(8 downto 0);
+  type rbd_t is array (0 to 3) of unsigned(17 downto 0);
+  signal rb_a : rba_t;                                  -- per bank: write address
+  signal rb_d : rbd_t;                                  -- per bank: write data
+  signal rb_we : std_logic_vector(3 downto 0);          -- per bank: write enable
+  signal rb_q : rbd_t := (others => (others => '0'));   -- per bank: read data
+  signal rb_rsel : unsigned(1 downto 0) := "00";
+  -- XCTL bit 3 valid bits, per bank (index bit 8 = the buffer half)
+  type cuv_t is array (0 to 3) of std_logic_vector(511 downto 0);
+  signal cu_v : cuv_t := (others => (others => '0'));
+  signal cu_we : std_logic_vector(3 downto 0) := (others => '0');
+  signal cu_a : rba_t := (others => (others => '0'));
   -- colour row buffer
   type cbuf_t is array (0 to 2047) of unsigned(7 downto 0);
   signal cbuf           : cbuf_t := (others => x"00");
@@ -117,28 +138,67 @@ architecture rtl of rrb_list_frontend is
   signal dg_line_t      : unsigned(15 downto 0) := (others => '0');   -- cycles since the line start
   signal dg_paint_run, dg_obj_pend : std_logic := '0';
 begin
+  -- raster buffer write: n = 1, 2 or 4 adjacent pixels ending at rb_wa (pixel k of n at
+  -- x = rb_wa - (n - 1) + k, within the half of rb_wa(10)); n adjacent pixels are in n different
+  -- banks.  For each bank: the pixel that falls into it, if any.
+  process (rb_wa, rb_write, rb_write2, rb_write3, rb_write4, rb_wd1, rb_wd2, rb_wd3, rb_wd4,
+           rb_double, rb_quad)
+    variable n, k : integer range 0 to 7;
+    variable x0, x : unsigned(9 downto 0);
+    type wv_t is array (0 to 3) of std_logic;
+    variable w : wv_t;
+    variable d : rbd_t;
+  begin
+    if rb_quad = '1' then
+      n := 4; w := (rb_write, rb_write2, rb_write3, rb_write4); d := (rb_wd1, rb_wd2, rb_wd3, rb_wd4);
+    elsif rb_double = '1' then
+      n := 2; w := (rb_write, rb_write2, '0', '0'); d := (rb_wd1, rb_wd2, rb_wd1, rb_wd1);
+    else
+      n := 1; w := (rb_write, '0', '0', '0'); d := (rb_wd1, rb_wd1, rb_wd1, rb_wd1);
+    end if;
+    x0 := rb_wa(9 downto 0) - to_unsigned(n - 1, 10);
+    for b in 0 to 3 loop
+      k := to_integer(to_unsigned(b, 2) - x0(1 downto 0));   -- (b - x0) mod 4
+      x := x0 + to_unsigned(k, 10);
+      rb_a(b) <= rb_wa(10) & x(9 downto 2);
+      rb_d(b) <= d(k);
+      if k < n then rb_we(b) <= w(k); else rb_we(b) <= '0'; end if;
+    end loop;
+  end process;
+  banks: for b in 0 to 3 generate
+    process (clk) begin
+      if rising_edge(clk) then
+        if rb_we(b) = '1' then
+          rbank(b)(to_integer(rb_a(b))) <= rb_d(b);
+        end if;
+        rb_q(b) <= rbank(b)(to_integer(rb_raddr_next(10) & rb_raddr_next(9 downto 2)));
+      end if;
+    end process;
+  end generate;
+  process (clk) begin
+    if rising_edge(clk) then rb_rsel <= rb_raddr_next(1 downto 0); end if;
+  end process;
+  rb_rdata <= rb_q(to_integer(rb_rsel));
+
   -- K325T XCTL bit 3: valid bits of the raster buffer (see cu_s)
   process (clk)
     variable vb : std_logic;
   begin
     if rising_edge(clk) then
-      cu_we0 <= rb_we0; cu_a0 <= rb_addr0(9 downto 0);
-      cu_we1 <= rb_we1; cu_a1 <= rb_addr1(9 downto 0);
-      if cu_clr = '1' then                       -- bit 9 of the index is the buffer half
-        if cu_clr_half = '0' then
-          cu_v0(511 downto 0) <= (others => '0'); cu_v1(511 downto 0) <= (others => '0');
-        else
-          cu_v0(1023 downto 512) <= (others => '0'); cu_v1(1023 downto 512) <= (others => '0');
-        end if;
+      for b in 0 to 3 loop
+        cu_we(b) <= rb_we(b); cu_a(b) <= rb_a(b);
+      end loop;
+      if cu_clr = '1' then                       -- bit 8 of the index is the buffer half
+        for b in 0 to 3 loop
+          if cu_clr_half = '0' then cu_v(b)(255 downto 0) <= (others => '0');
+          else cu_v(b)(511 downto 256) <= (others => '0'); end if;
+        end loop;
       end if;
-      if cu_we0 = '1' then cu_v0(to_integer(cu_a0)) <= '1'; end if;
-      if cu_we1 = '1' then cu_v1(to_integer(cu_a1)) <= '1'; end if;
+      for b in 0 to 3 loop
+        if cu_we(b) = '1' then cu_v(b)(to_integer(cu_a(b))) <= '1'; end if;
+      end loop;
       -- with the pixel the display reads (same address and latency as the buffer's read port)
-      if rb_raddr_next(0) = '1' then
-        vb := cu_v1(to_integer(rb_raddr_next(10 downto 1)));
-      else
-        vb := cu_v0(to_integer(rb_raddr_next(10 downto 1)));
-      end if;
+      vb := cu_v(to_integer(rb_raddr_next(1 downto 0)))(to_integer(rb_raddr_next(10) & rb_raddr_next(9 downto 2)));
       cu_vq <= vb;
     end if;
   end process;
@@ -222,11 +282,12 @@ begin
       -- the pixel it reads, inside the text area and before this line's fetch start (after it
       -- the writes belong to the next painting): that pixel comes too late for this line.
       -- (RAM write enable and address are these registered signals in this very cycle.)
-      if (rb_write = '1' or rb_write2 = '1') and chargen_active = '1'
-         and xcounter < display_fetch_start
+      if (rb_write = '1' or rb_write2 = '1' or rb_write3 = '1' or rb_write4 = '1')
+         and chargen_active = '1' and xcounter < display_fetch_start
          and rb_wa(10) = rb_ra(10) then
         lo := rb_wa(9 downto 0);
-        if rb_double = '1' then lo := lo - 1; end if;            -- pixel 1 of a double write
+        if rb_quad = '1' then lo := lo - 3;                       -- pixel 1 of a quad write
+        elsif rb_double = '1' then lo := lo - 1; end if;          -- pixel 1 of a double write
         if lo <= rb_ra(9 downto 0) then ev(DG_LATE) := '1'; end if;
       end if;
       dg_ev <= ev;

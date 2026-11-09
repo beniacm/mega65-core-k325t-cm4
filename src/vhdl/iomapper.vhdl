@@ -409,6 +409,7 @@ entity iomapper is
 
     colourram_at_dc00 : in std_logic;
     xctl_out : out unsigned(7 downto 0) := (others => '0');  -- K325T extension control
+    xctl2_out : out unsigned(7 downto 0) := (others => '0'); -- K325T XCTL2 ($FFD71F1)
     xobj_out : out unsigned(30 downto 0) := (others => '0');  -- K325T list mode v3 registers
     col_budget_out : out unsigned(15 downto 0) := (others => '0');  -- collision pair budget
     diag_sel_out : out unsigned(4 downto 0) := (others => '0');  -- K325T list mode diagnostics
@@ -1397,7 +1398,7 @@ begin
         fastio_read => r,
         fastio_wdata => unsigned(data_i),
         std_logic_vector(fastio_rdata) => data_o,
-        xctl_out => xctl_out,
+        xctl_out => xctl_out, xctl2_out => xctl2_out,
         xobj_out => xobj_out, col_budget_out => col_budget_out,
         diag_sel_out => diag_sel_out,
         diag_clr_out => diag_clr_out,
