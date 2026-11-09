@@ -192,6 +192,7 @@ architecture rtl of rk_bridge is
   -- miso_r can take it one clock earlier, from the first input stage (see the SPI slave)
   signal nxt_pre    : std_logic_vector(7 downto 0) := (others => '0');
   signal mbit_r     : std_logic := '0';
+  signal nxt_av     : std_logic := '0';   -- UART_GET: a byte was there when nxt_pre was taken
   signal rd_ready_r : std_logic := '0';
   signal rd_error_r : std_logic := '0';
   signal wr_ack_r   : std_logic := '0';
@@ -556,6 +557,7 @@ begin
           when others => nxt_pre <= x"00";
         end case;
       end if;
+      if rxf_wp_d2 /= rxf_pp then nxt_av <= '1'; else nxt_av <= '0'; end if;
       if bitcnt /= 7 then mbit_r <= tx_sr(6); else mbit_r <= nxt_pre(7); end if;
       if cs_s(1) = '0' and sck_s(1) = '0' and sck_s(0) = '1' then
         miso_r <= mbit_r;
@@ -622,7 +624,7 @@ begin
           else
             case cmd is
               when x"01" =>                 -- STATUS (byte 1 = dummy)
-                nxt := stat_q;              -- (status byte bidx - 1, registered below)
+                nxt := nxt_pre;             -- (stat_q: status byte bidx - 1, registered twice)
 
               when x"10" =>                 -- SD_PUT: payload bytes 1..512
                 put_i := to_integer(bidx) - 1;
@@ -684,7 +686,7 @@ begin
                 end case;
 
               when x"11" =>                 -- SD_GET: byte 1 dummy, then data
-                nxt := wbuf_q;
+                nxt := nxt_pre;             -- (wbuf_q, registered once more)
                 wbuf_raddr <= wbuf_raddr + 1;
 
               when x"20" =>                 -- UART_PUT
@@ -696,14 +698,16 @@ begin
                 end if;
 
               when x"21" =>                 -- UART_GET: byte 1 dummy, then data
-                if rxf_wp_d2 /= rxf_pp then
-                  nxt := rxf_dout;
+                -- (the byte and the "there is one" flag as registered together in nxt_pre / nxt_av:
+                -- a byte arriving in the last cycles goes with the next one)
+                if nxt_av = '1' then
+                  nxt := nxt_pre;
                   rxf_pp <= rxf_pp + 1;
                   cur_from_fifo <= '1';
                 end if;
 
               when x"40" =>                 -- ETH_TXGET: byte 1 dummy, then data
-                nxt := eth_tx_rdata;
+                nxt := nxt_pre;             -- (eth_tx_rdata, registered)
                 eth_raddr <= eth_raddr + 1;
 
               when x"41" =>                 -- ETH_RXPUT: len_hi, len_lo, data
@@ -744,7 +748,7 @@ begin
                       fl_last <= '1';
                     end if;
                   end if;
-                  nxt := fl_resp;
+                  nxt := nxt_pre;           -- (fl_resp, registered: 1 cycle older)
                 end if;
 
               when x"60" =>                 -- IPROG: addr(31..24) .. addr(7..0), $A5
@@ -782,8 +786,10 @@ begin
           if bidx = 0 then
             nxt := x"00";
           end if;
-          miso_r <= nxt(7);
-          tx_sr  <= nxt(6 downto 0);
+          -- the byte sent is nxt_pre: the same as nxt above (the arms say where it comes from),
+          -- but from a register, so nothing but a flip-flop drives miso_r / tx_sr here
+          miso_r <= nxt_pre(7);
+          tx_sr  <= nxt_pre(6 downto 0);
         end if;
       end if;
 
