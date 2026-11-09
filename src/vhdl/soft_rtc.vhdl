@@ -20,6 +20,8 @@
 -- $FFD71F8-$FFD71FA: list mode v2 object table address in chip RAM (20 bits, little endian)
 -- $FFD71FB: number of objects (0..255, 16 bytes each)
 -- $FFD71FC: bit 0 = HOLD: the VIC-IV keeps its last snapshot of the table (no copy per frame)
+-- $FFD71FD: read only, K325T extension level: 1 = everything up to XCTL bit 3, 2 = + the
+--   collides-with mask (object +15) and the list mode expansion overlapping the painting
 -- (gs4510 snoops these writes and acts on them; the copies here are for reading back)
 -- $FFD71E0-$FFD71E3: RRB list mode diagnostic counters (16-bit, in the VIC-IV, pixel clock):
 --   $FFD71E0 write: select counter 0..31, read: the selected index
@@ -103,6 +105,9 @@ architecture rtl of soft_rtc is
   signal tick_cnt       : integer range 0 to clock_frequency - 1 := 0;
   signal xctl           : unsigned(7 downto 0) := x"00";       -- $FFD71F0
   constant XCTL_BITS    : unsigned(7 downto 0) := x"FF";       -- implemented bits
+  -- $FFD71FD: K325T extension level (1 = XCTL bits 0-7 incl. bit 3; 2 = + collides-with mask
+  -- (+15) and the list mode expansion overlapping the painting, 2 KB list rows)
+  constant K325T_LEVEL  : unsigned(7 downto 0) := x"02";
   type rdl_t is array (0 to 3) of unsigned(7 downto 0);
   signal rdma_list      : rdl_t := (others => x"00");          -- $FFD71F4-7
   signal obj_tab        : rdl_t := (others => x"00");          -- $FFD71F8-B (B: count)
@@ -194,6 +199,7 @@ begin
         when x"FA" => fastio_rdata <= obj_tab(2) and x"0F";
         when x"FB" => fastio_rdata <= obj_tab(3);
         when x"FC" => fastio_rdata <= "0000000" & obj_hold;
+        when x"FD" => fastio_rdata <= K325T_LEVEL;          -- feature level (read only)
         when others => fastio_rdata <= x"00";
       end case;
     else

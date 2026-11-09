@@ -38,12 +38,14 @@
 --   +10 colour RAM offset of the tokens of object row 0
 --   +12 row stride: bytes from one object row's tokens to the next (screen and colour)
 --   +14 width in pixels for collisions (0 = 8)
+--   +15 collides-with mask (0 = the group mask): A and B collide if (gA and wB) and (gB and wA)
 -- Collisions (col_*; docs "Collisions"): during the copy every object's box is resolved (REL
 -- as in the scan) into a box RAM: X..X+W-1 (W = +14, 0 = 8), Y..Y+8H-1 (Y signed, H = +5 bits
 -- 5..0, 0 = 1), the group mask (+7), active = draw mask /= 0 and group /= 0.  On col_tick (once
 -- per frame) -- after the copy, or on the held snapshot -- a pass compares all pairs i < j of the
 -- snapshot's objects, one per cycle (n(n-1)/2 + ~7n cycles: 34164 for 255 objects): two active
--- objects with a common group bit and overlapping boxes collide.  Results: a bit per object,
+-- objects whose group (+7) meets the other's collides-with mask (+15, 0 = its group mask) both
+-- ways and whose boxes overlap collide.  Results: a bit per object,
 -- the first (lowest-numbered) partner per object, the count; double buffered (the pass writes
 -- the working set, CSwap makes it readable and toggles col_toggle).  A copy waits for a pass.
 -- Diagnostics only (the VIC-IV counters at $FFD71E0-3): ovf pulses when an expansion ends at
@@ -55,16 +57,21 @@ use ieee.std_logic_1164.all;
 use ieee.numeric_std.all;
 
 entity rrb_list_expander is
-  generic ( MLAT : integer := 4; CLAT : integer := 1; LIMIT : integer := 1020 );
+  generic ( MLAT : integer := 4; CLAT : integer := 1; LIMIT : integer := 1020;
+            BUFW : integer := 10 );                  -- row buffer index bits (VIC-IV: 11, 2 KB)
   port (
     clk       : in  std_logic;
     start     : in  std_logic;                        -- one cycle
     abort     : in  std_logic := '0';                 -- stop now (raster line restarted)
     ent_addr  : in  unsigned(19 downto 0);            -- chip RAM address of the first entry
-    out_start : in  unsigned(9 downto 0);             -- row buffer index of the LIST token
+    out_start : in  unsigned(BUFW - 1 downto 0);      -- row buffer index of the LIST token
     busy      : out std_logic;
+    -- overlap with painting (VIC-IV): reads only while ofree; wpos = next buffer write index
+    -- (every index below it is written for good while busy)
+    ofree     : in  std_logic := '1';
+    wpos      : out unsigned(BUFW - 1 downto 0);
     done      : out std_logic;                        -- one cycle when finished
-    out_len   : out unsigned(10 downto 0);            -- buffer index after the end-of-line token (<= LIMIT + 4)
+    out_len   : out unsigned(BUFW downto 0);          -- buffer index after the end-of-line token (<= LIMIT + 4)
     -- chip RAM (read only)
     mreq      : out std_logic;
     maddr     : out unsigned(19 downto 0);
@@ -74,7 +81,7 @@ entity rrb_list_expander is
     cdata     : in  unsigned(7 downto 0);
     -- row buffers (screen and colour), same index
     bwe       : out std_logic;
-    baddr     : out unsigned(9 downto 0);
+    baddr     : out unsigned(BUFW - 1 downto 0);
     bscreen   : out unsigned(7 downto 0);
     bcolour   : out unsigned(7 downto 0);
     -- list mode v2 (global object table)
@@ -109,7 +116,7 @@ architecture rtl of rrb_list_expander is
   -- request pipeline: what each in-flight chip RAM read was for
   type kind_t is (KNone, KEnt, KObj);
   type kinds_t is array (1 to MLAT) of kind_t;
-  type idx_t is array (1 to MLAT) of unsigned(9 downto 0);
+  type idx_t is array (1 to MLAT) of unsigned(BUFW - 1 downto 0);
   signal pk   : kinds_t := (others => KNone);
   signal pidx : idx_t := (others => (others => '0'));     -- entry byte number / buffer index
   -- object generation of each in-flight read: a finished object's extra reads (issued until its
@@ -125,11 +132,11 @@ architecture rtl of rrb_list_expander is
   signal ent_got  : integer range 0 to 8 := 0;
   signal ent_req  : integer range 0 to 8 := 0;
   signal eaddr    : unsigned(19 downto 0) := (others => '0');
-  signal opos     : unsigned(9 downto 0) := (others => '0');   -- next buffer write index
+  signal opos     : unsigned(BUFW - 1 downto 0) := (others => '0');   -- next buffer write index
   signal last_x   : unsigned(9 downto 0) := (others => '0');
   signal oaddr    : unsigned(19 downto 0) := (others => '0');  -- next object byte to request
   signal ocol     : unsigned(15 downto 0) := (others => '0');
-  signal oreq_idx : unsigned(9 downto 0) := (others => '0');   -- buffer index of next request
+  signal oreq_idx : unsigned(BUFW - 1 downto 0) := (others => '0');   -- buffer index of next request
   signal flipx, flipy : std_logic := '0';
   signal ended    : std_logic := '0';                          -- object $FFFF seen (or full)
   signal full     : std_logic := '0';                          -- buffer limit reached
@@ -183,14 +190,15 @@ architecture rtl of rrb_list_expander is
 
   -- v2 collisions: per object a box, written during the copy (REL resolved as the scan does)
   --   bits 10..0 x0, 21..11 x1 (x0 + width - 1), 33..22 y0 (signed), 45..34 y1 (y0 + 8 h - 1),
-  --   53..46 group mask, 54 active (draw mask /= 0 and group /= 0)
-  type box_t is array (0 to 255) of unsigned(55 downto 0);
+  --   53..46 group mask, 54 active (draw mask /= 0 and group /= 0), 63..56 collides-with mask
+  --   (+15; 0 = the group mask)
+  type box_t is array (0 to 255) of unsigned(63 downto 0);
   signal cbox     : box_t := (others => (others => '0'));
   signal cb_we    : std_logic := '0';
   signal cb_wa    : unsigned(7 downto 0) := (others => '0');
-  signal cb_wd    : unsigned(55 downto 0) := (others => '0');
+  signal cb_wd    : unsigned(63 downto 0) := (others => '0');
   signal cb_ra    : unsigned(7 downto 0) := (others => '0');
-  signal cb_q     : unsigned(55 downto 0) := (others => '0');
+  signal cb_q     : unsigned(63 downto 0) := (others => '0');
   signal cb_accx, cb_accy : unsigned(9 downto 0) := (others => '0');
   signal cb_x0, cb_y0 : unsigned(9 downto 0) := (others => '0');
   signal cb_h     : unsigned(5 downto 0) := (others => '0');
@@ -202,7 +210,7 @@ architecture rtl of rrb_list_expander is
   signal col_req  : std_logic := '0';
   signal c_n      : unsigned(8 downto 0) := (others => '0');
   signal c_i, c_j : unsigned(8 downto 0) := (others => '0');
-  signal c_a      : unsigned(55 downto 0) := (others => '0');
+  signal c_a      : unsigned(63 downto 0) := (others => '0');
   signal c_pv1, c_pv2 : std_logic := '0';
   signal c_pj1, c_pj2 : unsigned(7 downto 0) := (others => '0');
   signal c_w      : std_logic_vector(255 downto 0) := (others => '0');   -- working bits
@@ -226,6 +234,7 @@ architecture rtl of rrb_list_expander is
   end function;
 begin
   busy <= '0' when state = Idle else '1';
+  wpos <= opos;
   -- (the VIC-IV starts no expansion then); tab_we: the last table word is written in this cycle
   copying <= cp_run or cp_pend or copy_start or tab_we;
   part <= '1' when state = Gotox0 else '0';
@@ -254,7 +263,7 @@ begin
                else pram1(to_integer(col_pidx));
 
   process (clk)
-    variable a, b : unsigned(55 downto 0);
+    variable a, b : unsigned(63 downto 0);
     variable hit : boolean;
     variable inc : unsigned(7 downto 0);
     variable jj : integer range 0 to 255;
@@ -303,7 +312,10 @@ begin
           -- stage 2: box j against box i
           if c_pv2 = '1' then
             a := c_a; b := cb_q;
-            hit := a(54) = '1' and b(54) = '1' and (a(53 downto 46) and b(53 downto 46)) /= x"00"
+            -- groups: A's group meets B's collides-with mask and B's group meets A's
+            hit := a(54) = '1' and b(54) = '1'
+                   and (a(53 downto 46) and b(63 downto 56)) /= x"00"
+                   and (b(53 downto 46) and a(63 downto 56)) /= x"00"
                    and a(10 downto 0) <= b(21 downto 11) and b(10 downto 0) <= a(21 downto 11)
                    and signed(a(33 downto 22)) <= signed(b(45 downto 34))
                    and signed(b(33 downto 22)) <= signed(a(45 downto 34));
@@ -357,7 +369,7 @@ begin
 
   process (clk)
     variable k : kind_t;
-    variable i : unsigned(9 downto 0);
+    variable i : unsigned(BUFW - 1 downto 0);
     variable c : unsigned(7 downto 0);
     variable q : unsigned(63 downto 0);
     variable ax, ay : unsigned(9 downto 0);
@@ -372,6 +384,7 @@ begin
     variable fy : std_logic;
     variable cbw : unsigned(10 downto 0);
     variable cbh, cby : unsigned(11 downto 0);
+    variable cbwm : unsigned(7 downto 0);
   begin
     if rising_edge(clk) then
       done <= '0';
@@ -406,7 +419,9 @@ begin
             else cbh := "000" & cb_h & "000"; end if;
             cby := unsigned(resize(signed(cb_y0), 12));
             cb_we <= '1'; cb_wa <= cpi(MLAT)(11 downto 4);
-            cb_wd <= '0' & cb_act & cb_g & (cby + cbh - 1) & cby & (("0" & cb_x0) + cbw - 1) & ("0" & cb_x0);
+            -- +15: collides-with mask (0 = the group mask, the rule before +15)
+            if q(63 downto 56) = x"00" then cbwm := cb_g; else cbwm := q(63 downto 56); end if;
+            cb_wd <= cbwm & '0' & cb_act & cb_g & (cby + cbh - 1) & cby & (("0" & cb_x0) + cbw - 1) & ("0" & cb_x0);
           end if;
         end if;
         cp_asm <= mdata & cp_asm(55 downto 8);
@@ -454,7 +469,7 @@ begin
         c := cdl(MLAT - CLAT - 1);
         if i(0) = '0' then
           -- low byte of a token (colour byte 0: flip bits, GOTOX flag)
-          if i > to_unsigned(LIMIT, 10) then
+          if i > to_unsigned(LIMIT, BUFW) then
             ended <= '1'; full <= '1'; opos <= i;
           else
             if c(4) = '0' then                    -- a glyph, not a GOTOX inside the object
@@ -498,15 +513,17 @@ begin
           end if;
 
         when EntReq =>
-          mreq <= '1'; maddr <= eaddr + ent_req;
-          pk(1) <= KEnt; pidx(1) <= to_unsigned(ent_req, 10);
-          if ent_req = 7 then state <= EntWait; end if;
-          ent_req <= ent_req + 1;
+          if ofree = '1' then                     -- (else: the VIC-IV uses the port next cycle)
+            mreq <= '1'; maddr <= eaddr + ent_req;
+            pk(1) <= KEnt; pidx(1) <= to_unsigned(ent_req, BUFW);
+            if ent_req = 7 then state <= EntWait; end if;
+            ent_req <= ent_req + 1;
+          end if;
 
         when EntWait =>
           if ent_got = 8 then
             eaddr <= eaddr + 8;
-            if opos > to_unsigned(LIMIT - 2, 10) then
+            if opos > to_unsigned(LIMIT - 2, BUFW) then
               state <= Finish0; ovf <= '1';
             elsif ent(0) = x"FF" and ent(1) = x"FF" then
               if scan_after = '1' then
@@ -553,9 +570,9 @@ begin
             else
               state <= EntReq; ent_req <= 0; ent_got <= 0;
             end if;
-          elsif oreq_idx > to_unsigned(LIMIT + 1, 10) then
+          elsif oreq_idx > to_unsigned(LIMIT + 1, BUFW) then
             state <= ObjDrain;
-          else
+          elsif ofree = '1' then
             mreq <= '1'; maddr <= oaddr; caddr <= ocol;
             pk(1) <= KObj; pidx(1) <= oreq_idx; pg(1) <= og;
             oaddr <= oaddr + 1; ocol <= ocol + 1; oreq_idx <= oreq_idx + 1;
@@ -600,7 +617,7 @@ begin
           elsif spv = "00" then
             state <= Finish0;                     -- all objects seen
           end if;
-          if opos > to_unsigned(LIMIT - 2, 10) then
+          if opos > to_unsigned(LIMIT - 2, BUFW) then
             state <= Finish0; spv <= "00"; ovf <= '1';
           elsif spv(2) = '1' then
             q := tab_q;
@@ -668,7 +685,7 @@ begin
           ent(3) <= h_flags(7 downto 4) & pa_addr(19 downto 16);
           ent(4) <= pa_addr(7 downto 0); ent(5) <= pa_addr(15 downto 8);
           ent(6) <= pa_col(7 downto 0); ent(7) <= pa_col(15 downto 8);
-          if opos > to_unsigned(LIMIT - 2, 10) then
+          if opos > to_unsigned(LIMIT - 2, BUFW) then
             -- buffer limit as in EntWait (a GOTOX + tokens no longer fit): end the row here,
             -- also instead of resuming the scan
             h_pa <= '0'; h_pb <= '0';
