@@ -1020,6 +1020,8 @@ architecture Behavioral of viciv is
   signal rb_quad : std_logic := '0';
   signal quad_s : std_logic_vector(1 downto 0) := "00";       -- quad_px_en, synchronised
   signal rb_q17 : std_logic := '0';                           -- bit 17 chain after a 4 px step
+  signal exp_fastx : std_logic;                               -- the expander's fast object parts
+  signal exp_mdata32 : unsigned(31 downto 0) := (others => '0');
   signal raster_buffer_write3, raster_buffer_write4 : std_logic := '0';
   signal raster_buffer_write_data3, raster_buffer_write_data4 : unsigned(17 downto 0) := (others => '0');
   -- K325T XCTL bit 3 (cu_*): a pixel not painted in this painting of its buffer half shows as
@@ -1347,6 +1349,7 @@ architecture Behavioral of viciv is
 
 begin
 
+  exp_fastx <= quad_s(1) and rb_fast_s(1) and fp_s(1);   -- K325T step 7 (XCTL2 bit 0, bits 4 + 7)
   -- Raster buffer (K325T): four pixel banks in rrb_list_frontend.vhdl (1, 2 or 4 pixels per
   -- painting cycle at any alignment; the display reads raster_buffer_read_data as before)
 
@@ -1403,12 +1406,13 @@ begin
     generic map (MLAT => 3, CLAT => 1, LIMIT => RRB_LIST_LIMIT, BUFW => 11, NOBJ => rrb_nobj)
     port map (clk => pixelclock, start => exp_start, abort => exp_abort, ent_addr => exp_ent_addr,
               out_start => list_pos, busy => exp_busy, done => exp_done, out_len => exp_out_len,
-              mreq => exp_mreq, maddr => exp_maddr, mdata => final_ramdata,
+              mreq => exp_mreq, maddr => exp_maddr, mdata => final_ramdata, mdata32 => exp_mdata32,
               caddr => exp_caddr, cdata => colourramdata_ram,
               bwe => exp_bwe, baddr => exp_baddr, bscreen => exp_bscreen, bcolour => exp_bcolour,
               scan_en => rv2_s(1), start_scan => exp_start_scan, row => exp_row,
               obj_count => obj_count, copy_start => exp_copy_start, tab_addr => obj_tab_addr,
               mfree => exp_mfree, copying => exp_copying, ofree => exp_ofree, wpos => exp_wpos,
+              fastx => exp_fastx,
               ovf => exp_ovf, part => exp_part, cstall => exp_cstall,
               col_tick => exp_col_tick, col_bits => col_bits, col_count => col_count,
               col_toggle => col_toggle, col_pidx => col_pidx, col_pdata => col_pdata,
@@ -1428,7 +1432,10 @@ begin
                        or raster_fetch_state = SpriteDataFetch
                        or raster_fetch_state = SpriteDataFetch2
                        or ((raster_fetch_state = PaintMemWait or raster_fetch_state = PaintMemWait2)
-                           and (glyph_full_colour = '1' or fp_line = '1'))   -- (fast path: every glyph)
+                           and (glyph_full_colour = '1' or fp_line = '1')    -- (fast path: every glyph)
+                           -- (step 7, 4 px mode: a GOTOX's glyph data is never used, so its
+                           -- PaintMemWait/2 port cycles are the expander's -- see exp_ofree)
+                           and not (exp_fastx = '1' and fp_line = '1' and glyph_goto = '1'))
               else '0';
   fe_wait0 <= '1' when list_wait = 0 else '0';
   frontend: entity work.rrb_list_frontend
@@ -4506,6 +4513,7 @@ begin
         <= this_ramaccess_screen_row_buffer_address;
       last_screen_row_fetch_address <= this_screen_row_fetch_address;
       final_ramdata <= ramdata;
+      exp_mdata32 <= chipram_datain32;            -- (the word of final_ramdata's byte)
       final_ramaccess_is_screen_row_fetch <= last_ramaccess_is_screen_row_fetch;
       final_ramaccess_is_glyph_data_fetch <= last_ramaccess_is_glyph_data_fetch;
       final_ramaccess_is_sprite_data_fetch <= last_ramaccess_is_sprite_data_fetch;
@@ -6888,7 +6896,13 @@ begin
                              or (raster_fetch_state = PaintDispatch and fp_line = '0')
                              or (raster_fetch_state = TurboWait and fp_dec /= DFull)
                              or (raster_fetch_state = PaintMemWait2
-                                 and (glyph_full_colour = '0' or fp_line = '1')))
+                                 and (glyph_full_colour = '0' or fp_line = '1'))
+                             -- step 7 (4 px mode): a GOTOX needs no glyph data, so its
+                             -- PaintMemWait and the dispatch that takes it are free as well
+                             or (exp_fastx = '1' and fp_line = '1'
+                                 and ((raster_fetch_state = PaintMemWait and glyph_goto = '1')
+                                      or (raster_fetch_state = PaintDispatch
+                                          and (fp_dec /= DFull or n_goto = '1')))))
                else '0';
   exp_mfree <= '1' when (raster_fetch_state = Idle or raster_fetch_state = ListWait
                          or raster_fetch_state = ListRun)

@@ -76,6 +76,9 @@ entity rrb_list_expander is
     -- overlap with painting (VIC-IV): reads only while ofree; wpos = next buffer write index
     -- (every index below it is written for good while busy)
     ofree     : in  std_logic := '1';
+    -- K325T step 7 (XCTL2 bit 0): faster object parts of the scan -- a one-row hit goes straight
+    -- to HitEmit, and the object's first token reads are issued during its GOTOX (same output)
+    fastx     : in  std_logic := '0';
     wpos      : out unsigned(BUFW - 1 downto 0);
     done      : out std_logic;                        -- one cycle when finished
     out_len   : out unsigned(BUFW downto 0);          -- buffer index after the end-of-line token (<= LIMIT + 4)
@@ -83,6 +86,9 @@ entity rrb_list_expander is
     mreq      : out std_logic;
     maddr     : out unsigned(19 downto 0);
     mdata     : in  unsigned(7 downto 0);
+    -- the aligned 32-bit chip RAM word holding mdata's byte, at mdata's time (fastx: a token at a
+    -- 4-byte aligned address shows the $FFFF behind it, so the object ends 2 cycles earlier)
+    mdata32   : in  unsigned(31 downto 0) := (others => '0');
     -- colour RAM (read only)
     caddr     : out unsigned(15 downto 0);
     cdata     : in  unsigned(7 downto 0);
@@ -141,6 +147,10 @@ architecture rtl of rrb_list_expander is
   -- $FFFF came back) are ignored, so the next object starts without waiting for them
   type gen_t is array (1 to MLAT) of std_logic;
   signal pg   : gen_t := (others => '0');
+  type alo_t is array (1 to MLAT) of unsigned(1 downto 0);
+  signal palo : alo_t := (others => "00");                 -- address bits 1..0 of each read
+  signal nxt_ff : std_logic := '0';                        -- fastx: the token behind is $FFFF
+  signal maddr_i : unsigned(19 downto 0) := (others => '0');  -- (maddr, readable)
   signal og   : std_logic := '0';
   type cdel_t is array (1 to MLAT) of unsigned(7 downto 0);
   signal cdl  : cdel_t := (others => (others => '0'));    -- colour data, delayed
@@ -239,6 +249,10 @@ architecture rtl of rrb_list_expander is
   signal row_l    : unsigned(7 downto 0) := (others => '0');
   signal s_issue, s_end : unsigned(11 downto 0) := (others => '0');   -- bucket positions
   signal spv      : std_logic_vector(1 to 3) := "000";
+  -- fastx: the scan's next table word, read ahead while an object part is fetched and held
+  -- (tab_qb keeps it while no new bucket read is issued) until the scan resumes
+  signal sp_held  : std_logic := '0';
+  signal sp_hidx  : unsigned(11 downto 0) := (others => '0');
   type spi_t is array (1 to 3) of unsigned(11 downto 0);
   signal spi      : spi_t := (others => (others => '0'));
   signal h_x      : unsigned(9 downto 0) := (others => '0');
@@ -356,6 +370,7 @@ architecture rtl of rrb_list_expander is
     else return to_signed(0, 14); end if;
   end function;
 begin
+  maddr <= maddr_i;
   busy <= '0' when state = Idle else '1';
   wpos <= opos;
   -- (the VIC-IV starts no expansion then); tab_we: the last table word is written in this cycle
@@ -610,6 +625,7 @@ begin
     variable f, l : integer range -64 to 127;
     variable e, sb : unsigned(15 downto 0);
     variable infl : boolean;
+    variable endnow : boolean;
   begin
     if rising_edge(clk) then
       done <= '0';
@@ -676,7 +692,7 @@ begin
           if mfree = '1' then                    -- else stall: the VIC-IV uses the port now
             mreq <= '1';
             -- object o (32 bytes apart), byte 0..15
-            maddr <= cp_addr + (cp_issue(13 downto 4) & '0' & cp_issue(3 downto 0));
+            maddr_i <= cp_addr + (cp_issue(13 downto 4) & '0' & cp_issue(3 downto 0));
             cpv(1) <= '1'; cpi(1) <= cp_issue;
             cp_issue <= cp_issue + 1;
           end if;
@@ -760,12 +776,17 @@ begin
       for n in MLAT downto 2 loop
         pk(n) <= pk(n - 1); pidx(n) <= pidx(n - 1); cdl(n) <= cdl(n - 1); pg(n) <= pg(n - 1);
       end loop;
+      for n in MLAT downto 3 loop palo(n) <= palo(n - 1); end loop;
+      palo(2) <= maddr_i(1 downto 0);              -- (the read on the port now is pk(1)'s)
       pk(1) <= KNone;
       cdl(1) <= cdata;
 
       -- data returning now was requested MLAT cycles ago; caddr leaves this unit registered, so
       -- its colour byte arrived CLAT + 1 cycles after the request and waits in cdl(MLAT-CLAT-1)
       k := pk(MLAT); i := pidx(MLAT);
+      -- (fastx: the object's closing $FF$FF is back in this very cycle)
+      endnow := k = KObj and ended = '0' and pg(MLAT) = og and i(0) = '1'
+                and ((prev_ff = '1' and mdata = x"FF") or (fastx = '1' and nxt_ff = '1'));
       if k = KEnt then
         ent(to_integer(i(2 downto 0))) <= mdata;
         ent_got <= ent_got + 1;
@@ -782,6 +803,11 @@ begin
             end if;
             bwe <= '1'; baddr <= i; bscreen <= mdata; bcolour <= c;
             if mdata = x"FF" then prev_ff <= '1'; else prev_ff <= '0'; end if;
+            if fastx = '1' and palo(MLAT) = "00" and mdata32(31 downto 16) = x"FFFF" then
+              nxt_ff <= '1';
+            else
+              nxt_ff <= '0';
+            end if;
           end if;
         else
           if prev_ff = '1' and mdata = x"FF" then
@@ -789,6 +815,9 @@ begin
           else
             bwe <= '1'; baddr <= i; bscreen <= mdata; bcolour <= c;
             opos <= i + 1;
+            if fastx = '1' and nxt_ff = '1' then
+              ended <= '1';                       -- (the $FFFF behind was seen in the word)
+            end if;
           end if;
         end if;
       end if;
@@ -797,11 +826,14 @@ begin
       -- object number, 3 the table word
       spv(2 to 3) <= spv(1 to 2); spi(2 to 3) <= spi(1 to 2);
       spv(1) <= '0';
+      if spv(3) = '1' and state /= Scan then    -- (fastx read-ahead arrived: hold it)
+        sp_held <= '1'; sp_hidx <= spi(3);
+      end if;
 
       if abort = '1' then
         state <= Idle;
         pk <= (others => KNone);
-        scanning <= '0'; spv <= "000";
+        scanning <= '0'; spv <= "000"; sp_held <= '0';
       else
       case state is
         when Idle =>
@@ -819,7 +851,7 @@ begin
 
         when EntReq =>
           if ofree = '1' then                     -- (else: the VIC-IV uses the port next cycle)
-            mreq <= '1'; maddr <= eaddr + ent_req;
+            mreq <= '1'; maddr_i <= eaddr + ent_req;
             pk(1) <= KEnt; pidx(1) <= to_unsigned(ent_req, BUFW);
             if ent_req = 7 then state <= EntWait; end if;
             ent_req <= ent_req + 1;
@@ -850,26 +882,50 @@ begin
           bcolour <= ent(3)(6) & ent(3)(7) & "01" & (not mask_ff) & "000";
           last_x <= x_new;
           state <= Gotox1;
+          if fastx = '1' and scanning = '1' and ofree = '1' and oreq_idx <= to_unsigned(LIMIT + 1, BUFW) then
+            mreq <= '1'; maddr_i <= oaddr; caddr <= ocol;
+            pk(1) <= KObj; pidx(1) <= oreq_idx; pg(1) <= og;
+            oaddr <= oaddr + 1; ocol <= ocol + 1; oreq_idx <= oreq_idx + 1;
+          end if;
 
         when Gotox1 =>
           bwe <= '1'; baddr <= opos + 1;
           -- high byte: Y offset (15..13) and sign (12) as given, REL/reserved cleared, X 9..8
           bscreen <= ent(1)(7 downto 4) & "00" & gx(9 downto 8);
           bcolour <= ent(2);                      -- draw mask
-          flipx <= ent(3)(4); flipy <= ent(3)(5);
-          oaddr <= ent(3)(3 downto 0) & ent(5) & ent(4);
-          ocol  <= ent(7) & ent(6);
-          oreq_idx <= opos + 2;
           opos <= opos + 2;
-          ended <= '0'; prev_ff <= '0';
-          og <= not og;                           -- a new object: older reads are stale
           state <= ObjRun;
+          if fastx = '1' and scanning = '1' then
+            -- (set up in HitEmit; the reads go on)
+            if ofree = '1' and oreq_idx <= to_unsigned(LIMIT + 1, BUFW) then
+              mreq <= '1'; maddr_i <= oaddr; caddr <= ocol;
+              pk(1) <= KObj; pidx(1) <= oreq_idx; pg(1) <= og;
+              oaddr <= oaddr + 1; ocol <= ocol + 1; oreq_idx <= oreq_idx + 1;
+            end if;
+          else
+            flipx <= ent(3)(4); flipy <= ent(3)(5);
+            oaddr <= ent(3)(3 downto 0) & ent(5) & ent(4);
+            ocol  <= ent(7) & ent(6);
+            oreq_idx <= opos + 2;
+            ended <= '0'; prev_ff <= '0';
+            og <= not og;                         -- a new object: older reads are stale
+          end if;
 
         when ObjRun =>
-          if ended = '1' then
+          if ended = '1' or (fastx = '1' and endnow) then
             -- the object's $FFFF is back: its extra reads in flight are ignored (generation)
+            mb := h_mask and (shift_left(to_unsigned(1, 8), to_integer(h_o)) - 1);
             if full = '1' then
               state <= Finish0; ovf <= '1';
+            elsif scanning = '1' and fastx = '1' and not (h_pb = '1' and mb /= x"00") then
+              -- no other part of this object: on with the scan (HitEmit's last branch)
+              h_pa <= '0'; h_pb <= '0';
+              state <= Scan;
+              if s_issue < s_end and spv = "000" and sp_held = '0' then
+                pool_ab <= s_issue(10 downto 0);
+                spv(1) <= '1'; spi(1) <= s_issue;
+                s_issue <= s_issue + 1;
+              end if;
             elsif scanning = '1' then
               state <= HitEmit;                   -- v3: the other part, or on with the scan
             else
@@ -878,7 +934,7 @@ begin
           elsif oreq_idx > to_unsigned(LIMIT + 1, BUFW) then
             state <= ObjDrain;
           elsif ofree = '1' then
-            mreq <= '1'; maddr <= oaddr; caddr <= ocol;
+            mreq <= '1'; maddr_i <= oaddr; caddr <= ocol;
             pk(1) <= KObj; pidx(1) <= oreq_idx; pg(1) <= og;
             oaddr <= oaddr + 1; ocol <= ocol + 1; oreq_idx <= oreq_idx + 1;
           end if;
@@ -909,7 +965,7 @@ begin
 
         -- v3: walk the bucket of this character row
         when ScanStart =>
-          scanning <= '1';
+          scanning <= '1'; sp_held <= '0';
           if row_l < NROWS then
             if bk_st(to_integer(row_l) + 1) > PCAP then e := to_unsigned(PCAP, 16);
             else e := bk_st(to_integer(row_l) + 1); end if;
@@ -926,12 +982,13 @@ begin
             pool_ab <= s_issue(10 downto 0);
             spv(1) <= '1'; spi(1) <= s_issue;
             s_issue <= s_issue + 1;
-          elsif spv = "000" then
+          elsif spv = "000" and sp_held = '0' then
             state <= Finish0;                     -- all objects seen
           end if;
           if opos > to_unsigned(LIMIT - 2, BUFW) then
-            state <= Finish0; spv <= "000"; ovf <= '1';
-          elsif spv(3) = '1' then
+            state <= Finish0; spv <= "000"; sp_held <= '0'; ovf <= '1';
+          elsif spv(3) = '1' or sp_held = '1' then
+            sp_held <= '0';
             q := tab_qb;
             ax := unsigned(q(9 downto 0)); ay := unsigned(q(25 downto 16));
             -- object row of this character row's top part: row - floor(y / 8)
@@ -961,9 +1018,24 @@ begin
               h_addr <= unsigned(q(51 downto 48)) & unsigned(q(79 downto 64));
               h_col <= unsigned(q(95 downto 80));
               h_stride <= unsigned(q(111 downto 96));
-              s_issue <= spi(3) + 1;              -- resume after this object
+              if sp_held = '1' then s_issue <= sp_hidx + 1;
+              else s_issue <= spi(3) + 1; end if;  -- resume after this object
               spv <= "000";
               state <= HitB2;
+              if fastx = '1' and d = 0 then
+                -- object row 0 (no multiply): HitMul's work here, straight to HitEmit
+                aa := unsigned(q(51 downto 48)) & unsigned(q(79 downto 64));
+                ca := unsigned(q(95 downto 80));
+                pa_addr <= aa; pa_col <= ca;
+                if not pa then
+                  pb_addr <= aa; pb_col <= ca;
+                elsif q(53) = '1' then
+                  pb_addr <= aa + unsigned(q(111 downto 96)); pb_col <= ca + unsigned(q(111 downto 96));
+                else
+                  pb_addr <= aa - unsigned(q(111 downto 96)); pb_col <= ca - unsigned(q(111 downto 96));
+                end if;
+                state <= HitEmit;
+              end if;
             end if;
           end if;
 
@@ -999,6 +1071,17 @@ begin
             ent(1) <= h_o & (not fy) & "00" & h_x(9 downto 8);
             ent(2) <= ma;
             state <= Gotox0;
+            if fastx = '1' then                   -- (Gotox1's object set-up, done here)
+              flipx <= h_flags(4); flipy <= h_flags(5);
+              oaddr <= pa_addr; ocol <= pa_col;
+              oreq_idx <= opos + 2; ended <= '0'; prev_ff <= '0'; og <= not og;
+              -- read the scan's next table word ahead (held until the scan resumes)
+              if spv = "000" and sp_held = '0' and s_issue < s_end then
+                pool_ab <= s_issue(10 downto 0);
+                spv(1) <= '1'; spi(1) <= s_issue;
+                s_issue <= s_issue + 1;
+              end if;
+            end if;
           elsif h_pb = '1' and mb /= x"00" then
             h_pb <= '0'; h_pa <= '0';
             ent(1) <= ((not h_o) + 1) & fy & "00" & h_x(9 downto 8);
@@ -1007,11 +1090,23 @@ begin
             ent(4) <= pb_addr(7 downto 0); ent(5) <= pb_addr(15 downto 8);
             ent(6) <= pb_col(7 downto 0); ent(7) <= pb_col(15 downto 8);
             state <= Gotox0;
+            if fastx = '1' then                   -- (Gotox1's object set-up, done here)
+              flipx <= h_flags(4); flipy <= h_flags(5);
+              oaddr <= pb_addr; ocol <= pb_col;
+              oreq_idx <= opos + 2; ended <= '0'; prev_ff <= '0'; og <= not og;
+              -- read the scan's next table word ahead (held until the scan resumes)
+              if spv = "000" and sp_held = '0' and s_issue < s_end then
+                pool_ab <= s_issue(10 downto 0);
+                spv(1) <= '1'; spi(1) <= s_issue;
+                s_issue <= s_issue + 1;
+              end if;
+            end if;
           else
             h_pa <= '0'; h_pb <= '0';
             state <= Scan;
-            -- the scan's next bucket read already now (it resumes one cycle earlier)
-            if s_issue < s_end then
+            -- the scan's next bucket read already now (it resumes one cycle earlier; not when
+            -- the fastx read-ahead has one in flight or held)
+            if s_issue < s_end and spv = "000" and sp_held = '0' then
               pool_ab <= s_issue(10 downto 0);
               spv(1) <= '1'; spi(1) <= s_issue;
               s_issue <= s_issue + 1;
