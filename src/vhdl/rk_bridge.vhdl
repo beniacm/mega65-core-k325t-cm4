@@ -181,6 +181,12 @@ architecture rtl of rk_bridge is
   -- buffers / handshake
   signal wbuf_raddr : unsigned(8 downto 0) := (others => '0');
   signal wbuf_dout  : std_logic_vector(7 downto 0) := (others => '0');
+  -- wbuf_dout registered once more (the BRAM's output register): the SD_GET byte reaches the
+  -- MISO mux from a flip-flop, not from the BRAM's clock-to-out.  The read address changes at a
+  -- byte boundary and the next boundary is >= 32 clk cycles later, so the extra cycle of
+  -- latency is invisible (the prefetch at the command byte covers the first data byte).
+  signal wbuf_q     : std_logic_vector(7 downto 0) := (others => '0');
+  signal stat_q     : std_logic_vector(7 downto 0) := (others => '0');   -- STATUS byte, registered
   signal rd_ready_r : std_logic := '0';
   signal rd_error_r : std_logic := '0';
   signal wr_ack_r   : std_logic := '0';
@@ -345,6 +351,64 @@ begin
   rx_count   <= rxf_wp_d2 - rxf_rp;
   tx_free    <= to_unsigned(1024, 11) - (txf_wp - txf_rp);
 
+  -- STATUS bytes: the byte for index bidx - 1 (the one sent at the end of byte bidx), computed
+  -- every cycle into a register, so the wide status mux is off the boundary -> miso_r path.  The
+  -- sources are polled; bidx changes at a byte boundary and the next one is >= 32 cycles later.
+  process (clk)
+    variable st : integer;
+    variable v : std_logic_vector(7 downto 0);
+  begin
+    if rising_edge(clk) then
+      st := to_integer(bidx) - 1;
+      v := x"00";
+      case st is
+        when 0  => v := x"4D";
+        when 1  => v := x"65";
+        when 2  => v := VERSION;
+        when 3  => v := "00" & rd_error_r & rx_overflow & inited_s(1) & wr_req_s(1)
+                          & rd_ready_r & rd_req_s(1);
+        when 4  => v := std_logic_vector(seq_f);
+        when 5  => v := std_logic_vector(lba_f(31 downto 24));
+        when 6  => v := std_logic_vector(lba_f(23 downto 16));
+        when 7  => v := std_logic_vector(lba_f(15 downto 8));
+        when 8  => v := std_logic_vector(lba_f(7 downto 0));
+        when 9  => v := "0" & std_logic_vector(rx_count(14 downto 8));
+        when 10 => v := std_logic_vector(rx_count(7 downto 0));
+        when 11 => v := "00000" & std_logic_vector(tx_free(10 downto 8));
+        when 12 => v := std_logic_vector(tx_free(7 downto 0));
+        when 13 => v := std_logic_vector(ccnt_f);
+        when 14 => v := std_logic_vector(lcmd_f);
+        when 15 => v := ctrl_r;
+        when 16 => if eth_avail_r = '1' then v := "00000" & std_logic_vector(eth_len_r(10 downto 8)); end if;
+        when 17 => if eth_avail_r = '1' then v := std_logic_vector(eth_len_r(7 downto 0)); end if;
+        when 18 => v := "0000" & std_logic_vector(eth_free_r);
+        when 19 => v := std_logic_vector(eth_drops_r);
+        when 52 => v := CORE_ID;
+        when 53 => v := "0000000" & fl_ovf;
+        when 54 => v := vld(15 downto 8);
+        when 55 => v := vld(7 downto 0);
+        when 56 => v := std_logic_vector(hit_cnt(15 downto 8));
+        when 57 => v := std_logic_vector(hit_cnt(7 downto 0));
+        when 58 => v := "000" & std_logic_vector(act_slot);
+        when 59 => v := vid_r;
+        when 60 => v := video_diag(31 downto 24);
+        when 61 => v := video_diag(23 downto 16);
+        when 62 => v := video_diag(15 downto 8);
+        when 63 => v := video_diag(7 downto 0);
+        when 64 => v := video_diag2(63 downto 56);
+        when 65 => v := video_diag2(55 downto 48);
+        when 66 => v := video_diag2(47 downto 40);
+        when 67 => v := video_diag2(39 downto 32);
+        when 68 => v := video_diag2(31 downto 24);
+        when 69 => v := video_diag2(23 downto 16);
+        when 70 => v := video_diag2(15 downto 8);
+        when 71 => v := video_diag2(7 downto 0);
+        when others => v := x"00";
+      end case;
+      stat_q <= v;
+    end if;
+  end process;
+
   -- RAM ports in the fast domain (one write process per RAM -> BRAM)
   process (clk)
   begin
@@ -353,6 +417,7 @@ begin
         rbuf(to_integer(rbuf_wa)) <= rbuf_wd;
       end if;
       wbuf_dout <= wbuf(to_integer(wbuf_raddr));
+      wbuf_q <= wbuf_dout;
       if txf_we = '1' then
         txf(to_integer(txf_wa)) <= txf_wd;
       end if;
@@ -528,51 +593,7 @@ begin
           else
             case cmd is
               when x"01" =>                 -- STATUS (byte 1 = dummy)
-                st := to_integer(bidx) - 1;
-                case st is
-                  when 0  => nxt := x"4D";
-                  when 1  => nxt := x"65";
-                  when 2  => nxt := VERSION;
-                  when 3  => nxt := "00" & rd_error_r & rx_overflow & inited_s(1) & wr_req_s(1)
-                                    & rd_ready_r & rd_req_s(1);
-                  when 4  => nxt := std_logic_vector(seq_f);
-                  when 5  => nxt := std_logic_vector(lba_f(31 downto 24));
-                  when 6  => nxt := std_logic_vector(lba_f(23 downto 16));
-                  when 7  => nxt := std_logic_vector(lba_f(15 downto 8));
-                  when 8  => nxt := std_logic_vector(lba_f(7 downto 0));
-                  when 9  => nxt := "0" & std_logic_vector(rx_count(14 downto 8));
-                  when 10 => nxt := std_logic_vector(rx_count(7 downto 0));
-                  when 11 => nxt := "00000" & std_logic_vector(tx_free(10 downto 8));
-                  when 12 => nxt := std_logic_vector(tx_free(7 downto 0));
-                  when 13 => nxt := std_logic_vector(ccnt_f);
-                  when 14 => nxt := std_logic_vector(lcmd_f);
-                  when 15 => nxt := ctrl_r;
-                  when 16 => if eth_avail_r = '1' then nxt := "00000" & std_logic_vector(eth_len_r(10 downto 8)); end if;
-                  when 17 => if eth_avail_r = '1' then nxt := std_logic_vector(eth_len_r(7 downto 0)); end if;
-                  when 18 => nxt := "0000" & std_logic_vector(eth_free_r);
-                  when 19 => nxt := std_logic_vector(eth_drops_r);
-                  when 52 => nxt := CORE_ID;
-                  when 53 => nxt := "0000000" & fl_ovf;
-                  when 54 => nxt := vld(15 downto 8);
-                  when 55 => nxt := vld(7 downto 0);
-                  when 56 => nxt := std_logic_vector(hit_cnt(15 downto 8));
-                  when 57 => nxt := std_logic_vector(hit_cnt(7 downto 0));
-                  when 58 => nxt := "000" & std_logic_vector(act_slot);
-                  when 59 => nxt := vid_r;
-                  when 60 => nxt := video_diag(31 downto 24);
-                  when 61 => nxt := video_diag(23 downto 16);
-                  when 62 => nxt := video_diag(15 downto 8);
-                  when 63 => nxt := video_diag(7 downto 0);
-                  when 64 => nxt := video_diag2(63 downto 56);
-                  when 65 => nxt := video_diag2(55 downto 48);
-                  when 66 => nxt := video_diag2(47 downto 40);
-                  when 67 => nxt := video_diag2(39 downto 32);
-                  when 68 => nxt := video_diag2(31 downto 24);
-                  when 69 => nxt := video_diag2(23 downto 16);
-                  when 70 => nxt := video_diag2(15 downto 8);
-                  when 71 => nxt := video_diag2(7 downto 0);
-                  when others => nxt := x"00";
-                end case;
+                nxt := stat_q;              -- (status byte bidx - 1, registered below)
 
               when x"10" =>                 -- SD_PUT: payload bytes 1..512
                 put_i := to_integer(bidx) - 1;
@@ -634,7 +655,7 @@ begin
                 end case;
 
               when x"11" =>                 -- SD_GET: byte 1 dummy, then data
-                nxt := wbuf_dout;
+                nxt := wbuf_q;
                 wbuf_raddr <= wbuf_raddr + 1;
 
               when x"20" =>                 -- UART_PUT
