@@ -1075,6 +1075,13 @@ begin
               flipx <= h_flags(4); flipy <= h_flags(5);
               oaddr <= pa_addr; ocol <= pa_col;
               oreq_idx <= opos + 2; ended <= '0'; prev_ff <= '0'; og <= not og;
+              -- the glyph's low read already now (batch 4 (a)): it is back after Gotox1's write
+              -- (MLAT >= 3), so the part's four buffer writes run back to back
+              if MLAT >= 3 and ofree = '1' and opos + 2 <= to_unsigned(LIMIT + 1, BUFW) then
+                mreq <= '1'; maddr_i <= pa_addr; caddr <= pa_col;
+                pk(1) <= KObj; pidx(1) <= opos + 2; pg(1) <= not og;
+                oaddr <= pa_addr + 1; ocol <= pa_col + 1; oreq_idx <= opos + 3;
+              end if;
               -- read the scan's next table word ahead (held until the scan resumes)
               if spv = "000" and sp_held = '0' and s_issue < s_end then
                 pool_ab <= s_issue(10 downto 0);
@@ -1094,6 +1101,13 @@ begin
               flipx <= h_flags(4); flipy <= h_flags(5);
               oaddr <= pb_addr; ocol <= pb_col;
               oreq_idx <= opos + 2; ended <= '0'; prev_ff <= '0'; og <= not og;
+              -- the glyph's low read already now (batch 4 (a)): it is back after Gotox1's write
+              -- (MLAT >= 3), so the part's four buffer writes run back to back
+              if MLAT >= 3 and ofree = '1' and opos + 2 <= to_unsigned(LIMIT + 1, BUFW) then
+                mreq <= '1'; maddr_i <= pb_addr; caddr <= pb_col;
+                pk(1) <= KObj; pidx(1) <= opos + 2; pg(1) <= not og;
+                oaddr <= pb_addr + 1; ocol <= pb_col + 1; oreq_idx <= opos + 3;
+              end if;
               -- read the scan's next table word ahead (held until the scan resumes)
               if spv = "000" and sp_held = '0' and s_issue < s_end then
                 pool_ab <= s_issue(10 downto 0);
