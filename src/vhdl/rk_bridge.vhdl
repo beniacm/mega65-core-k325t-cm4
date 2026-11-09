@@ -164,6 +164,13 @@ architecture rtl of rk_bridge is
   signal bidx   : unsigned(11 downto 0) := (others => '0');  -- byte index, saturating (Ethernet frames up to 1518 + 3 bytes)
   signal cmd    : std_logic_vector(7 downto 0) := (others => '0');
   signal miso_r : std_logic := '0';
+  -- ethernet status bytes 16..19, registered one cycle before the STATUS mux (they are polled:
+  -- one cycle of staleness is harmless; the live eth_tx_avail -> mux -> miso_r path was the
+  -- design's critical path)
+  signal eth_avail_r : std_logic := '0';
+  signal eth_len_r   : unsigned(10 downto 0) := (others => '0');
+  signal eth_free_r  : unsigned(3 downto 0) := (others => '0');
+  signal eth_drops_r : unsigned(7 downto 0) := (others => '0');
   signal tx_sr  : std_logic_vector(6 downto 0) := (others => '0');
 
   -- inputs from the cpuclk domain, synchronised
@@ -373,6 +380,8 @@ begin
     end function;
   begin
     if rising_edge(clk) then
+      eth_avail_r <= eth_tx_avail; eth_len_r <= eth_tx_len;
+      eth_free_r <= eth_rx_free; eth_drops_r <= eth_tx_drops;
       vld_v := vld;
       fresh_v := (others => '0');
       rbuf_we   <= '0';
@@ -538,10 +547,10 @@ begin
                   when 13 => nxt := std_logic_vector(ccnt_f);
                   when 14 => nxt := std_logic_vector(lcmd_f);
                   when 15 => nxt := ctrl_r;
-                  when 16 => if eth_tx_avail = '1' then nxt := "00000" & std_logic_vector(eth_tx_len(10 downto 8)); end if;
-                  when 17 => if eth_tx_avail = '1' then nxt := std_logic_vector(eth_tx_len(7 downto 0)); end if;
-                  when 18 => nxt := "0000" & std_logic_vector(eth_rx_free);
-                  when 19 => nxt := std_logic_vector(eth_tx_drops);
+                  when 16 => if eth_avail_r = '1' then nxt := "00000" & std_logic_vector(eth_len_r(10 downto 8)); end if;
+                  when 17 => if eth_avail_r = '1' then nxt := std_logic_vector(eth_len_r(7 downto 0)); end if;
+                  when 18 => nxt := "0000" & std_logic_vector(eth_free_r);
+                  when 19 => nxt := std_logic_vector(eth_drops_r);
                   when 52 => nxt := CORE_ID;
                   when 53 => nxt := "0000000" & fl_ovf;
                   when 54 => nxt := vld(15 downto 8);
