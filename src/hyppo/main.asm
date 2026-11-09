@@ -614,7 +614,7 @@ reset_entry:
         ldx #<msg_hyppohelpfirst
         ldy #>msg_hyppohelpfirst
         jsr printmessage
-        jmp first_boot_flag_instruction
+        jmp try_flash_menu
 
 not_first_boot_message:
         ldx #<msg_hyppohelpnotfirst
@@ -624,6 +624,16 @@ not_first_boot_message:
         ;; Work out if we are on first reset.  If so, then try switching to bitstream in 2nd slot.
 
 try_flash_menu:
+        ;; QMTech K325T ($D629 = $62): no flash menu.  Core switching and flash writing are the
+        ;; Rockchip's job, and the chip RAM is not pre-loaded (no megaflash at $50000, no OpenROM
+        ;; at $20000): mark the first boot as done (also suppresses onboarding) and boot normally.
+        lda $d629
+        cmp #$62
+        bne first_boot_flag_instruction
+        lda #$4c
+        sta first_boot_flag_instruction
+        jmp dont_launch_flash_menu
+
         ;; Use first boot code path only once
         ;; WARNING: Self modifying code!
 first_boot_flag_instruction:
@@ -826,6 +836,15 @@ trybus0:
 
         ;; No working SD card -- we can just try booting to BASIC, since we
         ;; now include our open-source ROM
+        ;; (QMTech K325T: there is no built-in ROM; the Rockchip serves the card, possibly later
+        ;; than the FPGA starts: wait and boot again)
+        lda $d629
+        cmp #$62
+        bne @noK325Tcard
+        ldx #<msg_k325t_nocard
+        ldy #>msg_k325t_nocard
+        jmp k325t_retry_boot
+@noK325Tcard:
         ldx #<msg_nosdcard
         ldy #>msg_nosdcard
         jsr printmessage
@@ -1421,12 +1440,35 @@ l17d:   lda txt_MEGA65ROM,x
         ldy #>msg_romnotfound
         jsr printmessage
 
+        ;; (QMTech K325T: no built-in ROM to fall back to: wait and boot again)
+        lda $d629
+        cmp #$62
+        bne @noK325Trom
+        ldx #<msg_k325t_norom
+        ldy #>msg_k325t_norom
+        jmp k325t_retry_boot
+@noK325Trom:
+
         jsr sdwaitawhile
         jsr sdwaitawhile
         jsr sdwaitawhile
         jsr sdwaitawhile
 
         jmp go64
+
+        ;; QMTech K325T: print the message in X/Y, wait about as long as four ROM-not-found
+        ;; delays, then restart the boot (as the ROM-too-long path does): a card the Rockchip
+        ;; serves late, or a ROM that appears, boots the machine without a reset
+k325t_retry_boot:
+        jsr printmessage
+        ldx #$08
+@wait:
+        phx
+        jsr sdwaitawhile
+        plx
+        dex
+        bne @wait
+        jmp reset_entry
 
 ;;         ========================
 
@@ -2040,7 +2082,7 @@ go64:
 
         ;; Prevent utility menu from being launched
         lda #$4c
-        sta utility_menu
+        sta utility_menu_selfmod
 
         ;; Prevent flash menu from being launched
         lda #$4c
@@ -2284,6 +2326,13 @@ resetmemmap:
 !src "keyboard.asm"
 
 utility_menu_check:
+        ;; (QMTech K325T: the utility menu runs on the pre-loaded OpenROM KERNAL, which this
+        ;; target does not have: no utility menu)
+        lda $d629
+        cmp #$62
+        bne @notK325T
+        rts
+@notK325T:
         lda buckykey_status
         cmp #$20 ;; NO-SCROLL
         beq @startFlashMenu
@@ -2616,6 +2665,16 @@ safe_video_mode:
         rts
 
 utility_menu:
+        ;; (QMTech K325T: no utility menu -- it runs on the pre-loaded OpenROM KERNAL, which this
+        ;; target does not have.  It is offered when the card has no usable disk: wait for the
+        ;; card the Rockchip serves and boot again instead)
+        lda $d629
+        cmp #$62
+        bne utility_menu_selfmod
+        ldx #<msg_k325t_nocard
+        ldy #>msg_k325t_nocard
+        jmp k325t_retry_boot
+utility_menu_selfmod:
         ;; Gets self-modified to prevent entering utility menu except on first boot
         bit noutility_menu
 
@@ -3128,6 +3187,12 @@ msg_sdcarderror:        !text "ERROR READING FROM SD CARD"
 ;; msg_sdredoread:      !text "RE-READING SDCARD"
 ;;                      !8 0
 msg_nosdcard:           !text "NO SDCARD, TRYING BUILT-IN ROM"
+                        !8 0
+msg_k325t_nocard:       !text "K325T: WAITING FOR SD CARD"
+                        !8 0
+msg_k325t_norom:        !text "K325T: MEGA65.ROM NOT FOUND, RETRYING"
+                        !8 0
+msg_k325t_noconfig:     !text "K325T: NO CONFIG, USING DEFAULTS"
                         !8 0
 msg_badformat:          !text "BAD MBR OR DOS BOOT SECTOR."
                         !8 0

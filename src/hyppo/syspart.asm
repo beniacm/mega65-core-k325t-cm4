@@ -213,6 +213,15 @@ spo4:        sec
         rts
 
 do_launch_onboarding:
+        ;; QMTech K325T: no onboarding utility (the chip RAM is not pre-loaded with ONBOARD.M65)
+        lda $d629
+        cmp #$62
+        bne @notK325T
+        ldx #<msg_k325t_noconfig
+        ldy #>msg_k325t_noconfig
+        jsr printmessage
+        jmp no_onboarding
+@notK325T:
         ;; Only try onboarding on first boot
         lda first_boot_flag_instruction
         cmp #$4c
