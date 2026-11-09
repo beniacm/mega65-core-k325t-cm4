@@ -130,7 +130,7 @@ architecture rtl of soft_rtc is
   -- $FFD71FD: K325T extension level (1 = XCTL bits 0-7 incl. bit 3; 2 = + collides-with mask
   -- (+15) and the list mode expansion overlapping the painting, 2 KB list rows)
   -- 3 = list mode v3 (32-byte entries, 1023 objects, buckets, circles, budget, $FFD72xx)
-  constant K325T_LEVEL  : unsigned(7 downto 0) := x"03";
+  constant K325T_LEVEL  : unsigned(7 downto 0) := x"04";   -- 4: XCTL2 ($FFD71F1) bit 0, 4 px painting
   type rdl_t is array (0 to 3) of unsigned(7 downto 0);
   signal rdma_list      : rdl_t := (others => x"00");          -- $FFD71F4-7
   signal obj_tab        : rdl_t := (others => x"00");          -- $FFD71F8-B (B: count)
