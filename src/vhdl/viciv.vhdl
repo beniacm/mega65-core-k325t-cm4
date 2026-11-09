@@ -1022,6 +1022,11 @@ architecture Behavioral of viciv is
   signal rb_q17 : std_logic := '0';                           -- bit 17 chain after a 4 px step
   signal exp_fastx : std_logic;                               -- the expander's fast object parts
   signal exp_mdata32 : unsigned(31 downto 0) := (others => '0');
+  -- the decoder's own copies of a decoded GOTOX's effects on the tokens after it (Y offset, its
+  -- sign, the draw mask), so that in 4 px mode it need not wait for the GOTOX's dispatch
+  signal dsh_y : integer range 0 to 7 := 0;
+  signal dsh_nve : std_logic := '0';
+  signal dsh_mask : unsigned(7 downto 0) := (others => '1');
   signal raster_buffer_write3, raster_buffer_write4 : std_logic := '0';
   signal raster_buffer_write_data3, raster_buffer_write_data4 : unsigned(17 downto 0) := (others => '0');
   -- K325T XCTL bit 3 (cu_*): a pixel not painted in this painting of its buffer half shows as
@@ -3351,6 +3356,10 @@ begin
     variable rb_v1, rb_v2 : unsigned(17 downto 0);    -- K325T fast RRB pixels
     variable rb_v3, rb_v4 : unsigned(17 downto 0);    -- K325T 4 px painting
     variable quad_ok : boolean;
+    variable qd : boolean;                            -- 4 px mode: decoder uses its shadows
+    variable dec_y : integer range 0 to 7;
+    variable dec_nve : std_logic;
+    variable dec_mask : unsigned(7 downto 0);
     variable c17 : std_logic;
     variable yf : unsigned(11 downto 0);              -- K325T list mode: fetch side's displayy
     -- K325T fast token path
@@ -3396,8 +3405,8 @@ begin
       fds := fp_dec;
       fast_ok := rb_fast_s(1) = '1' and (raster_buffer_write_address(9 downto 0) <= 1020 or rrb_wraparound_allowed = '1');
       -- K325T step 7: four pixels per cycle (XCTL2 bit 0 with XCTL bits 4 and 7)
-      quad_ok := quad_s(1) = '1' and rb_fast_s(1) = '1' and fp_s(1) = '1'
-                 and (raster_buffer_write_address(9 downto 0) <= 1018 or rrb_wraparound_allowed = '1');
+      qd := quad_s(1) = '1' and rb_fast_s(1) = '1' and fp_s(1) = '1';
+      quad_ok := qd and (raster_buffer_write_address(9 downto 0) <= 1018 or rrb_wraparound_allowed = '1');
       case paint_fsm_state is
         when PaintFullColourPixels | Paint4bitColourPixels =>
           p_last := (fast_ok and paint_bits_remaining = 1) or (not fast_ok and paint_bits_remaining = 0)
@@ -4836,6 +4845,7 @@ begin
           end if;
           -- K325T fast token path for CHR16 text lines: the decoder starts with token 0 (the
           -- screen buffer read address is 0 from the next cycle on)
+          dsh_y <= 0; dsh_nve <= '0'; dsh_mask <= (others => '1');
           fp_line <= '0'; fp_dec <= DIdle; fp_goto_pend <= '0';
           if fp_s(1) = '1' and rb_fast_s(1) = '1' and text_mode = '1' and sixteenbit_charset = '1'
              and bitplane_mode = '0' and (glyphs_from_hyperram = '0' or not hyper_installed) then
@@ -5462,7 +5472,9 @@ begin
           if paint_ready='1'
              or (fp_line = '1' and p_last and glyph_goto = '0'
                  and (glyph_full_colour = '1'
-                      or (multicolour_mode = '0' and extended_background_mode = '0'))) then
+                      or (multicolour_mode = '0' and extended_background_mode = '0')))
+             -- (4 px mode: a GOTOX as soon as the painter is in Idle -- its last write is out)
+             or (qd and fp_line = '1' and glyph_goto = '1' and paint_fsm_state = Idle) then
             paint_from_charrom <= character_data_from_rom;
             report "character rom address set to $" & to_hstring(glyph_data_address(11 downto 0)) severity note;
             -- Tell painter whether to flip horizontally or not.
@@ -5912,6 +5924,8 @@ begin
       -- FetchCharHighByte, FetchTextCell and FetchTextCellColourAndSource for CHR16 text, into
       -- the n_* registers, one token ahead; not in a line-start cycle (the line start owns the
       -- screen buffer and colour RAM addresses then).
+      if qd then dec_y := dsh_y; dec_nve := dsh_nve; dec_mask := dsh_mask;
+      else dec_y := glyph_y_offset; dec_nve := glyph_nve_y_offset; dec_mask := screenline_draw_mask; end if;
       if fds = D0 and not rd_ok(screen_ram_buffer_read_address, expanding, list_pos, exp_busy, exp_wpos_d) then
         fds := DIdle;                             -- K325T step 5: wait for the expander
       end if;
@@ -5963,7 +5977,8 @@ begin
             fp_dec <= D2;
           when D2 =>
             -- waits while a GOTOX before this token is not dispatched (draw mask, Y offset)
-            if fp_goto_pend = '0' then
+            -- (4 px mode: never -- the decoder's own copies of the GOTOX's effects are used)
+            if fp_goto_pend = '0' or qd then
               if row_list = '1' and screen_ram_buffer_read_address > list_pos then
                 n_list_in_exp <= '1';
               end if;
@@ -5979,20 +5994,20 @@ begin
                   n_short_line_length <= safe_to_integer(screen_ram_buffer_read_address);
                 end if;
               end if;
-              n_draw_mask_blank <= not screenline_draw_mask(to_integer(chargen_y_hold));
+              n_draw_mask_blank <= not dec_mask(to_integer(chargen_y_hold));
               if n_full_colour = '1' then
                 n_glyph_data_address(19) <= '0';
                 if n_flip_v = '1' then
-                  if glyph_nve_y_offset = '1' then
-                    n_glyph_data_address(18 downto 3) <= (n_glyph_number(12 downto 0) & not chargen_y_hold) - glyph_y_offset;
+                  if dec_nve = '1' then
+                    n_glyph_data_address(18 downto 3) <= (n_glyph_number(12 downto 0) & not chargen_y_hold) - dec_y;
                   else
-                    n_glyph_data_address(18 downto 3) <= (n_glyph_number(12 downto 0) & not chargen_y_hold) + glyph_y_offset;
+                    n_glyph_data_address(18 downto 3) <= (n_glyph_number(12 downto 0) & not chargen_y_hold) + dec_y;
                   end if;
                 else
-                  if glyph_nve_y_offset = '1' then
-                    n_glyph_data_address(18 downto 3) <= (n_glyph_number(12 downto 0) & chargen_y_hold) - glyph_y_offset;
+                  if dec_nve = '1' then
+                    n_glyph_data_address(18 downto 3) <= (n_glyph_number(12 downto 0) & chargen_y_hold) - dec_y;
                   else
-                    n_glyph_data_address(18 downto 3) <= (n_glyph_number(12 downto 0) & chargen_y_hold) + glyph_y_offset;
+                    n_glyph_data_address(18 downto 3) <= (n_glyph_number(12 downto 0) & chargen_y_hold) + dec_y;
                   end if;
                 end if;
                 if n_flip_h = '1' then
@@ -6035,6 +6050,10 @@ begin
             n_blink_drive <= '0';
             if n_goto = '1' then
               n_draw_mask_drive <= colourramdata;
+              -- the decoder's copies of what this GOTOX's dispatch will set
+              dsh_y <= to_integer(n_width_deduct(2 downto 0));
+              dsh_nve <= n_glyph_number(12);
+              if n_4bit = '1' then dsh_mask <= colourramdata; else dsh_mask <= (others => '1'); end if;
             end if;
             n_bold_and_reverse <= colourramdata(5) and colourramdata(6);
             if multicolour_mode='1' then
