@@ -183,7 +183,7 @@ SDCARD_FILES= \
 FLASHER_FILES= \
 	$(UTILDIR)/megaflash/mflash.prg
 
-CURRENT_TARGETS=mega65r6 mega65r4 mega65r3 mega65r2 nexys4ddr-widget qmtech-k325t-cm4
+CURRENT_TARGETS=mega65r6 mega65r4 mega65r3 mega65r2 nexys4ddr-widget qmtech-k325t-cm4 qmtech-k325t-cm4-radxacm3
 CHECK_CURRENT_TARGETS=check-mega65r6 check-mega65r4 check-mega65r3 check-mega65r2 check-nexys4ddr-widget
 
 all:	freezer_files $(SDCARD_DIR)/MEGA65.D81
@@ -1316,6 +1316,17 @@ $(TOOLDIR)/on_screen_keyboard_gen:	$(TOOLDIR)/on_screen_keyboard_gen.c Makefile
 
 # Generated HDL files
 preliminaries: $(VERILOGSRCDIR)/monitor_mem.v $(M65VHDL)
+
+# QMTech K325T with a Radxa CM3 instead of the Luckfox Core3566: the same design with the CM bus
+# section of the pin file replaced and the module's picture as BT.656 (top generic bt656).
+$(VHDLSRCDIR)/qmtech-k325t-cm4-radxacm3.xdc:	$(VHDLSRCDIR)/qmtech-k325t-cm4.xdc $(VHDLSRCDIR)/qmtech-k325t-cm4-radxacm3-bus.xdc Makefile
+	awk -v f=$(VHDLSRCDIR)/qmtech-k325t-cm4-radxacm3-bus.xdc '/^## >>> CM bus/ { while ((getline l < f) > 0) print l; skip=1; next } /^## <<< CM bus/ { skip=0; next } !skip' $< > $@
+vivado/qmtech-k325t-cm4-radxacm3_gen.tcl:	vivado/qmtech-k325t-cm4_gen.tcl $(VHDLSRCDIR)/qmtech-k325t-cm4-radxacm3.xdc Makefile
+	sed -e 's/^set project_name "qmtech-k325t-cm4"/set project_name "qmtech-k325t-cm4-radxacm3"/' -e 's,vhdl/qmtech-k325t-cm4\.xdc,vhdl/qmtech-k325t-cm4-radxacm3.xdc,g' $< > $@
+	echo 'set_property generic {bt656=true} [get_filesets sources_1]' >> $@
+vivado/qmtech-k325t-cm4-radxacm3_impl.tcl:	vivado/qmtech-k325t-cm4_impl.tcl
+	cp $< $@
+$(BINDIR)/qmtech-k325t-cm4-radxacm3.bit:	vivado/qmtech-k325t-cm4-radxacm3_impl.tcl
 
 # Generate Vivado .xpr from .tcl
 vivado/%.xpr: 	vivado/%_gen.tcl | preliminaries $(VHDLSRCDIR)/*.vhdl $(VHDLSRCDIR)/*.xdc $(VERILOGSRCDIR)/*.v

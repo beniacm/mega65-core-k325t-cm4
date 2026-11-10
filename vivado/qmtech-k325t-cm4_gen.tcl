@@ -160,6 +160,7 @@ set files [list \
  "[file normalize "$origin_dir/src/vhdl/rrb_list_frontend.vhdl"]"\
  "[file normalize "$origin_dir/src/verilog/bt1120_rx.v"]"\
  "[file normalize "$origin_dir/src/verilog/bt1120_video.v"]"\
+ "[file normalize "$origin_dir/src/verilog/bt656_video.v"]"\
  "[file normalize "$origin_dir/src/vhdl/mfm_bits_to_bytes.vhdl"]"\
  "[file normalize "$origin_dir/src/vhdl/mfm_bits_to_gaps.vhdl"]"\
  "[file normalize "$origin_dir/src/vhdl/mfm_decoder.vhdl"]"\

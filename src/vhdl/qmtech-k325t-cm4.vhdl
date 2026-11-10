@@ -39,6 +39,11 @@ use work.cputypes.all;
 use work.types_pkg.all;
 
 entity container is
+  generic (
+    -- true: the module's picture comes as BT.656 on bt_d(7..0) (Radxa CM3; set by the
+    -- qmtech-k325t-cm4-radxacm3 project together with its pin file), else BT1120 (Luckfox Core3566)
+    bt656 : boolean := false
+  );
   port (
     clk_in       : in std_logic;      -- 50 MHz, F22
     reset_button : in std_logic;      -- SW3, active low
@@ -451,9 +456,10 @@ begin
   -- so switching is seamless.
   btclk_bufg : BUFG port map (I => bt_clk, O => bt_clk_b);
   linuxfb0 : entity work.linux_fb
+    generic map ( BT656 => bt656 )
     port map (
       bt_clk => bt_clk_b, bt_d => bt_d,
-      clk27 => clock27, show_linux => video_sel(0), cap_rise => video_sel(1), diag => video_diag,
+      clk27 => clock27, show_linux => video_sel(0), cap_rise => video_sel(1), cap_uv => video_sel(2), diag => video_diag,
       diag2 => video_diag2,
       in_de => hdmi_dataenable, in_hs => v_hdmi_hsync, in_vs => v_vsync,
       in_r => v_red, in_g => v_green, in_b => v_blue,

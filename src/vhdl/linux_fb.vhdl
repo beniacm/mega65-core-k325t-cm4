@@ -23,7 +23,11 @@ library unisim;
 use unisim.vcomponents.all;
 
 entity linux_fb is
-  generic ( WIDTH : integer := 720; HEIGHT : integer := 576 );
+  generic ( WIDTH : integer := 720; HEIGHT : integer := 576;
+            -- true: bt_d(7 downto 0) is BT.656 (8 bit, Cb Y Cr Y, bt_clk = twice the pixel clock);
+            -- the Radxa CM3's only video output that reaches the FPGA (bt656_video.v).
+            -- cap_uv then exchanges Cb and Cr.
+            BT656 : boolean := false );
   port (
     -- BT1120 from the Rockchip
     bt_clk     : in  std_logic;                       -- 27 or 74.25 MHz (already on a BUFG)
@@ -33,6 +37,7 @@ entity linux_fb is
     show_linux : in  std_logic;                       -- any clock (static); synchronised here
     cap_rise   : in  std_logic := '0';                -- any clock (static): '1' = sample the BT1120
                                                       -- data on the rising clock edge, else falling
+    cap_uv     : in  std_logic := '0';                -- any clock (static), BT656 only: Cr first
     diag       : out std_logic_vector(31 downto 0);   -- bt_clk domain, read as quasi-static:
                                                       -- frames(8) | lines(12) | flags(4) | px/line(11:4)
     diag2      : out std_logic_vector(63 downto 0);   -- raw bus, per 2^20 bt_clk window: lines seen
@@ -66,6 +71,13 @@ architecture rtl of linux_fb is
     return r;
   end function;
 
+  component bt656_video is
+    port (pclk : in std_logic; rst_n : in std_logic; bt_d : in std_logic_vector(7 downto 0);
+          uv_swap : in std_logic;
+          rgb : out std_logic_vector(23 downto 0); de : out std_logic; pv : out std_logic;
+          field : out std_logic; il : out std_logic;
+          locked : out std_logic; y_first : out std_logic);
+  end component;
   component bt1120_video is
     port (pclk : in std_logic; rst_n : in std_logic; bt_d : in std_logic_vector(15 downto 0);
           rgb : out std_logic_vector(23 downto 0); de : out std_logic;
@@ -79,6 +91,9 @@ architecture rtl of linux_fb is
   signal bt_q     : std_logic_vector(15 downto 0) := (others => '0');
   signal rgb      : std_logic_vector(23 downto 0);
   signal de_w     : std_logic;
+  signal pv_w     : std_logic := '1';                   -- rgb is a new pixel (BT656: 2 clocks in 4)
+  signal fld_w, il_w : std_logic := '0';                -- BT656: field of the line, interlaced source
+  signal uv_s     : std_logic_vector(1 downto 0) := "00";
   signal wblank   : integer range 0 to 4095 := 0;
   signal wx       : integer range 0 to 4095 := 0;       -- pixel in the current line
   signal wy       : integer range 0 to 4095 := 0;       -- line in the current frame
@@ -99,6 +114,7 @@ architecture rtl of linux_fb is
   signal acc_hi, acc_lo, seen_hi, seen_lo : std_logic_vector(15 downto 0) := (others => '0');
   signal ffl, ffh, ffl_l, ffh_l : unsigned(7 downto 0) := x"00";
   attribute ASYNC_REG of rise_s : signal is "TRUE";
+  attribute ASYNC_REG of uv_s : signal is "TRUE";
 
   -- read side (clk27)
   signal raddr    : integer range 0 to PIXELS - 1 := 0;
@@ -143,9 +159,21 @@ begin
   diag2 <= seen_hi & seen_lo & std_logic_vector(ffl_l) & std_logic_vector(ffh_l)
            & std_logic_vector(clkcnt(31 downto 16));
 
-  video0 : bt1120_video
-    port map (pclk => bt_clk, rst_n => '1', bt_d => bt_q, rgb => rgb, de => de_w,
-              hsync => open, vsync => open, locked => lock_i, yc_swapped => swap_i);
+  v1120 : if not BT656 generate
+    video0 : bt1120_video
+      port map (pclk => bt_clk, rst_n => '1', bt_d => bt_q, rgb => rgb, de => de_w,
+                hsync => open, vsync => open, locked => lock_i, yc_swapped => swap_i);
+    pv_w <= '1'; fld_w <= '0'; il_w <= '0';
+  end generate;
+  v656 : if BT656 generate
+    process (bt_clk) begin
+      if rising_edge(bt_clk) then uv_s <= uv_s(0) & cap_uv; end if;
+    end process;
+    video0 : bt656_video
+      port map (pclk => bt_clk, rst_n => '1', bt_d => bt_q(7 downto 0), uv_swap => uv_s(1),
+                rgb => rgb, de => de_w, pv => pv_w, field => fld_w, il => il_w,
+                locked => lock_i, y_first => swap_i);
+  end generate;
   linux_locked <= lock_i;
   diag <= std_logic_vector(frames) & std_logic_vector(lines_l) & rise_s(1) & seen_de & swap_i & lock_i
           & std_logic_vector(px_l(11 downto 4));
@@ -159,18 +187,26 @@ begin
       if de_w = '1' then
         wblank <= 0;
         seen_de <= '1';
-        if wx < WIDTH and wy < HEIGHT then
-          we1 <= '1';
-          wa1 <= wrow + wx;
-          wd1 <= rgb(23 downto 21) & rgb(15 downto 13) & rgb(7 downto 6);
+        if pv_w = '1' then
+          -- (an interlaced source: field 1's lines go between field 0's)
+          if wx < WIDTH and (wy < HEIGHT - 1 or (wy < HEIGHT and not (il_w = '1' and fld_w = '1'))) then
+            we1 <= '1';
+            if il_w = '1' and fld_w = '1' then wa1 <= wrow + WIDTH + wx; else wa1 <= wrow + wx; end if;
+            wd1 <= rgb(23 downto 21) & rgb(15 downto 13) & rgb(7 downto 6);
+          end if;
+          if wx /= 4095 then wx <= wx + 1; end if;
         end if;
-        if wx /= 4095 then wx <= wx + 1; end if;
       else
         wx <= 0;
         if de_d = '1' then                                  -- end of a line
           px_l <= to_unsigned(wx, 12);
-          if wy /= 4095 then wy <= wy + 1; end if;
-          if wy < HEIGHT then wrow <= wrow + WIDTH; end if;
+          if il_w = '1' then
+            if wy < 4094 then wy <= wy + 2; end if;
+            if wy < HEIGHT - 2 then wrow <= wrow + 2 * WIDTH; end if;
+          else
+            if wy /= 4095 then wy <= wy + 1; end if;
+            if wy < HEIGHT then wrow <= wrow + WIDTH; end if;
+          end if;
         end if;
         if wblank /= 4095 then wblank <= wblank + 1; end if;
         if wblank > 3000 then wy <= 0; wrow <= 0; end if;   -- > 2 lines without data: vblank

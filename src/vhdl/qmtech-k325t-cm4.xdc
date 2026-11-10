@@ -55,6 +55,7 @@ set_property -dict {PACKAGE_PIN B25 IOSTANDARD LVCMOS33}             [get_ports 
 set_property -dict {PACKAGE_PIN C26 IOSTANDARD LVCMOS33 PULLUP TRUE} [get_ports ds2_miso]
 set_property -dict {PACKAGE_PIN E26 IOSTANDARD LVCMOS33}             [get_ports ds2_clk]
 
+## >>> CM bus: this section is replaced for other modules (qmtech-k325t-cm4-radxacm3-bus.xdc, Makefile)
 ## CM4 GPIO bus to the Rockchip (see ~/qmtech/PINMAP.md).
 ## The only FPGA output on this bus is rk_miso (B9) -> Rockchip spi3 MISO (an input).
 ##   Service bridge, Rockchip spi3-m1 master (/dev/spidev3.0), pins proven in ~/qmtech:
@@ -97,6 +98,7 @@ set_false_path -from [get_ports {bt_d[*]}]
 ## 2-FF synchroniser for the select bit.
 set_clock_groups -asynchronous -group [get_clocks -include_generated_clocks bt_clk]
 ## (No other CM4 line is used; the boot DTB's BT1120 mux drives exactly these pads.)
+## <<< CM bus
 
 ## QSPI configuration flash (S25FL128L); CCLK is driven via STARTUPE2.
 set_property -dict {PACKAGE_PIN B24 IOSTANDARD LVCMOS33 PULLUP TRUE} [get_ports {qspi_db[0]}]

@@ -51,6 +51,22 @@ make bin/qmtech-k325t-cm4.bit          # or the harness's scripts/build.sh (hand
 Vivado 2025.2 was used.  Load with JTAG for testing, or write it to the configuration flash
 from the Rockchip (`m65flash.py write 0 …` in the harness).
 
+**Radxa CM3 instead of the Luckfox Core3566** (branch `radxacm3`): the Radxa CM3 puts other
+RK3566 pads on the 28 CM4 lines, so it has its own target:
+```
+make bin/qmtech-k325t-cm4-radxacm3.bit
+```
+Same design; the Makefile generates the project from the default one, replacing the CM bus
+section of the pin file (between the `## >>> CM bus` / `## <<< CM bus` markers) with
+`src/vhdl/qmtech-k325t-cm4-radxacm3-bus.xdc` and setting the top generic `bt656`.  The bridge
+SPI moves to BCM8-11 (CS A12, MISO D14, MOSI C13, SCK D13 = the module's spi3 M0, still
+`/dev/spidev3.0`), and the module's Linux picture arrives as 8-bit BT.656 (`src/verilog/bt656_video.v`,
+`linux_fb` generic `BT656`; clock C12, D0..D7 = A13 B15 B9 A8 A9 B14 A14 E18) instead of 16-bit
+BT1120.  Bridge VIDEO bit 2 swaps Cb/Cr (BT.656 only).  Do not load one module's bitstream with
+the other module fitted: each drives its SPI MISO on a line that is a module output on the other.
+Built and verified on the Radxa CM3 board 2026-11-10 (details in the harness README, section
+"Radxa CM3 variant").
+
 ## Following upstream
 
 ```
